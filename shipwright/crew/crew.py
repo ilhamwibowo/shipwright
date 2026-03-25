@@ -563,3 +563,263 @@ class Crew:
             ))
 
         return crew
+
+
+# ---------------------------------------------------------------------------
+# Enterprise Mode — 3-level hierarchy
+# ---------------------------------------------------------------------------
+
+MAX_HIERARCHY_DEPTH = 3
+
+
+@dataclass
+class EnterpriseCrew(Crew):
+    """Enterprise crew: Project Lead → Sub-Crew Leads → Members.
+
+    Instead of delegating to individual CrewMembers, delegation spawns
+    full sub-crews (each with their own lead + members).
+
+    Hard-capped at 3 levels of hierarchy.
+    """
+
+    depth: int = 1  # 1 = top-level enterprise crew
+    sub_crews: dict[str, Crew] = field(default_factory=dict)
+
+    def _ensure_members(self) -> None:
+        """Enterprise crew doesn't create members — it spawns sub-crews on demand."""
+        # Members dict stays empty; sub-crews are created during delegation.
+        pass
+
+    async def _execute_delegation(
+        self,
+        delegation: DelegationRequest,
+        context: str,
+    ) -> MemberResult:
+        """Override: spawn a sub-crew instead of running a single member."""
+        return await self._delegate_to_subcrew(
+            crew_type=delegation.member_name,
+            task=delegation.task,
+            context=context,
+        )
+
+    async def delegate(
+        self,
+        member_name: str,
+        task: str,
+        context: str = "",
+        on_text: Callable[[str], None] | None = None,
+    ) -> MemberResult:
+        """Override: delegate to a sub-crew instead of an individual member."""
+        return await self._delegate_to_subcrew(
+            crew_type=member_name,
+            task=task,
+            context=context,
+        )
+
+    async def delegate_parallel(
+        self,
+        tasks: list[tuple[str, str, str]],
+    ) -> dict[str, MemberResult]:
+        """Override: delegate to multiple sub-crews in parallel."""
+        coros = [
+            self._delegate_to_subcrew(crew_type=name, task=task, context=ctx)
+            for name, task, ctx in tasks
+        ]
+        results = await asyncio.gather(*coros, return_exceptions=True)
+
+        output = {}
+        for (name, _, _), result in zip(tasks, results):
+            if isinstance(result, Exception):
+                output[name] = MemberResult(output=str(result), is_error=True)
+            else:
+                output[name] = result
+        return output
+
+    async def _delegate_to_subcrew(
+        self,
+        crew_type: str,
+        task: str,
+        context: str = "",
+    ) -> MemberResult:
+        """Spawn a full sub-crew and run the task through it.
+
+        The sub-crew gets its own lead + members and runs a complete
+        delegation loop. Results flow back up to the project lead.
+        """
+        from shipwright.crew.registry import get_crew_def, BUILTIN_CREWS
+
+        # Enforce depth cap
+        if self.depth >= MAX_HIERARCHY_DEPTH:
+            return MemberResult(
+                output=f"Cannot spawn sub-crew: maximum hierarchy depth ({MAX_HIERARCHY_DEPTH}) reached.",
+                is_error=True,
+            )
+
+        # Resolve the crew type — only allow known non-enterprise types
+        if crew_type == "enterprise":
+            return MemberResult(
+                output="Cannot nest enterprise crews. Delegate to specific crew types (backend, frontend, etc.).",
+                is_error=True,
+            )
+
+        try:
+            sub_crew_def = get_crew_def(crew_type, self.config)
+        except ValueError:
+            available = list(BUILTIN_CREWS.keys())
+            available = [k for k in available if k != "enterprise"]
+            return MemberResult(
+                output=f"Unknown crew type '{crew_type}'. Available: {', '.join(available)}",
+                is_error=True,
+            )
+
+        # Don't accidentally spawn another enterprise crew
+        if sub_crew_def.name == "enterprise":
+            return MemberResult(
+                output="Cannot nest enterprise crews.",
+                is_error=True,
+            )
+
+        # Create sub-crew
+        sub_id = f"{self.id}/{crew_type}"
+        project_context = self.lead.project_context
+
+        record = TaskRecord(member_name=crew_type, task=task)
+        self.task_records.append(record)
+        record.status = "running"
+        record.started_at = time.time()
+        self.status = CrewStatus.WORKING
+
+        logger.info(
+            "[%s] Spawning sub-crew '%s' (depth %d) for: %s",
+            self.id, crew_type, self.depth + 1, task[:80],
+        )
+
+        try:
+            sub_crew = Crew(
+                id=sub_id,
+                crew_type=crew_type,
+                objective=task,
+                config=self.config,
+                crew_def=sub_crew_def,
+            )
+            sub_crew.lead.project_context = project_context
+
+            # Set up worktree branched from enterprise crew's branch
+            if self.worktree_path and self.branch:
+                sub_branch = f"{self.branch}/{crew_type}"
+                sub_crew.branch = sub_branch
+                sub_crew.worktree_path = create_worktree(
+                    self.worktree_path, sub_branch,
+                )
+                # Update member cwd after worktree setup
+                for member in sub_crew.members.values():
+                    member.cwd = str(sub_crew.worktree_path)
+
+            self.sub_crews[crew_type] = sub_crew
+
+            # Build the full prompt with context
+            prompt = task
+            if context:
+                prompt = f"{context}\n\n---\n\nTask:\n{task}"
+
+            # Run the sub-crew's delegation loop
+            result_text = await sub_crew.chat(user_message=prompt)
+
+            record.status = "done"
+            record.output = result_text
+
+            logger.info("[%s] Sub-crew '%s' completed", self.id, crew_type)
+            return MemberResult(output=result_text)
+
+        except Exception as exc:
+            record.status = "failed"
+            record.output = str(exc)
+            logger.error("[%s] Sub-crew '%s' failed: %s", self.id, crew_type, exc)
+            return MemberResult(output=str(exc), is_error=True)
+
+        finally:
+            record.finished_at = time.time()
+            if not any(r.status == "running" for r in self.task_records):
+                if any(r.status == "failed" for r in self.task_records):
+                    self.status = CrewStatus.FAILED
+                else:
+                    self.status = CrewStatus.IDLE
+
+    def cleanup(self) -> None:
+        """Clean up all sub-crew worktrees, then our own."""
+        for sub_crew in self.sub_crews.values():
+            try:
+                sub_crew.cleanup()
+            except Exception as e:
+                logger.warning("Sub-crew cleanup failed: %s", e)
+        super().cleanup()
+
+    @property
+    def summary(self) -> str:
+        """Human-readable summary including sub-crew hierarchy."""
+        parts = [super().summary]
+
+        if self.sub_crews:
+            parts.append("  Sub-crews:")
+            for name, sub in self.sub_crews.items():
+                status = sub.status.value
+                done = sum(1 for r in sub.task_records if r.status == "done")
+                total = len(sub.task_records)
+                task_info = f" ({done}/{total} tasks)" if total else ""
+                parts.append(f"    → {name} [{status}]{task_info}")
+
+        return "\n".join(parts)
+
+    def to_dict(self) -> dict:
+        """Serialize enterprise crew state."""
+        data = super().to_dict()
+        data["is_enterprise"] = True
+        data["depth"] = self.depth
+        data["sub_crews"] = {
+            name: sub.to_dict() for name, sub in self.sub_crews.items()
+        }
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict, crew_def: CrewDef, config: Config) -> "EnterpriseCrew":
+        """Restore an enterprise crew from persisted data."""
+        crew = cls(
+            id=data["id"],
+            crew_type=data["crew_type"],
+            objective=data["objective"],
+            config=config,
+            crew_def=crew_def,
+        )
+        crew.status = CrewStatus(data.get("status", "idle"))
+        crew.branch = data.get("branch")
+        wt = data.get("worktree_path")
+        crew.worktree_path = Path(wt) if wt and Path(wt).exists() else None
+        crew.pr_url = data.get("pr_url")
+        crew.created_at = data.get("created_at", time.time())
+        crew.depth = data.get("depth", 1)
+
+        if "lead" in data:
+            crew.lead.restore_from_dict(data["lead"])
+
+        for rec_data in data.get("task_records", []):
+            crew.task_records.append(TaskRecord(
+                member_name=rec_data["member_name"],
+                task=rec_data["task"],
+                status=rec_data.get("status", "done"),
+                output=rec_data.get("output", ""),
+                started_at=rec_data.get("started_at"),
+                finished_at=rec_data.get("finished_at"),
+                cost_usd=rec_data.get("cost_usd", 0.0),
+            ))
+
+        # Restore sub-crews
+        from shipwright.crew.registry import get_crew_def as _get_crew_def
+        for name, sub_data in data.get("sub_crews", {}).items():
+            try:
+                sub_def = _get_crew_def(sub_data["crew_type"], config)
+                sub_crew = Crew.from_dict(sub_data, sub_def, config)
+                crew.sub_crews[name] = sub_crew
+            except (ValueError, KeyError) as e:
+                logger.warning("Failed to restore sub-crew %s: %s", name, e)
+
+        return crew

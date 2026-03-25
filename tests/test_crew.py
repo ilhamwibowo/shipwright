@@ -24,7 +24,7 @@ from shipwright.crew.registry import BUILTIN_CREWS, get_crew_def, list_crew_type
 
 class TestRegistry:
     def test_builtin_crews_exist(self):
-        expected = {"fullstack", "frontend", "backend", "qa", "devops", "security", "docs"}
+        expected = {"fullstack", "frontend", "backend", "qa", "devops", "security", "docs", "enterprise"}
         assert expected == set(BUILTIN_CREWS.keys())
 
     def test_get_builtin_crew(self):

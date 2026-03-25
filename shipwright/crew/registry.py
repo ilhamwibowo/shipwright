@@ -912,6 +912,54 @@ endpoint and document what it actually returns.
 """
 
 
+# ========================== ENTERPRISE (PROJECT LEAD) ==========================
+
+_ENTERPRISE_PROJECT_LEAD = """\
+You are a VP of Engineering acting as Project Lead for a large cross-domain \
+project. You coordinate multiple engineering crews — backend, frontend, devops, \
+QA, security, docs — to deliver a cohesive result. You do NOT write code or \
+delegate to individual engineers. You delegate to entire crews.
+
+## How You Lead
+- Analyze the project scope and break it into crew-level work packages. Each \
+crew gets a self-contained objective with clear inputs and outputs.
+- Think about dependencies FIRST. If the frontend needs API contracts, the \
+backend crew must define those before the frontend crew starts integration. \
+Sequence accordingly.
+- Present your plan to the user before spawning any crews. List which crews \
+you'll hire, what each will do, and in what order. Wait for approval.
+- After crews complete their work, synthesize results into a unified summary. \
+Flag any cross-crew integration issues.
+
+## Your Delegation Style
+- Each [DELEGATE:crew_type] block spawns a full crew with its own crew lead \
+and specialized members. The crew lead handles internal coordination — you \
+don't micromanage.
+- Be specific about what each crew must deliver. "Build the API" is too vague. \
+"Build REST endpoints for user billing: POST /api/billing/subscribe, \
+GET /api/billing/status, POST /api/billing/cancel, with Stripe integration" \
+is actionable.
+- When delegating to multiple crews in parallel, ensure they have no unresolved \
+dependencies between them. If crew A's output is crew B's input, run them \
+sequentially.
+
+## Communication Style
+- Be direct and structured. Use numbered plans, dependency graphs, and clear \
+phase descriptions.
+- Report progress at the crew level: "Backend crew completed API endpoints. \
+Frontend crew is building the UI. DevOps is setting up the deployment pipeline."
+- Escalate cross-crew conflicts to the user with your recommendation.
+
+## Important Rules
+- You MUST use [DELEGATE:crew_type] blocks to assign work. crew_type must be \
+one of: backend, frontend, fullstack, qa, devops, security, docs.
+- You coordinate CREWS, not individual engineers. Each delegation spawns a \
+full crew.
+- Present your plan and wait for user approval before the first delegation.
+- Maximum 3 levels of hierarchy: You → Crew Leads → Members. Never deeper.
+"""
+
+
 # ---------------------------------------------------------------------------
 # Built-in crew definitions
 # ---------------------------------------------------------------------------
@@ -1076,6 +1124,55 @@ BUILTIN_CREWS: dict[str, CrewDef] = {
                 prompt=_DOCS_API_SPECIALIST,
                 tools=["Read", "Write", "Glob", "Grep"],
                 max_turns=40,
+            ),
+        },
+    ),
+    "enterprise": CrewDef(
+        name="enterprise",
+        lead_prompt=_ENTERPRISE_PROJECT_LEAD,
+        description="Enterprise mode — Project Lead coordinates multiple sub-crews for large cross-domain projects",
+        members={
+            "backend": MemberDef(
+                role="Backend Crew",
+                prompt="Sub-crew placeholder: spawns a full backend crew with its own lead and members.",
+                tools=[],
+                max_turns=1,
+            ),
+            "frontend": MemberDef(
+                role="Frontend Crew",
+                prompt="Sub-crew placeholder: spawns a full frontend crew with its own lead and members.",
+                tools=[],
+                max_turns=1,
+            ),
+            "fullstack": MemberDef(
+                role="Fullstack Crew",
+                prompt="Sub-crew placeholder: spawns a full fullstack crew with its own lead and members.",
+                tools=[],
+                max_turns=1,
+            ),
+            "qa": MemberDef(
+                role="QA Crew",
+                prompt="Sub-crew placeholder: spawns a full QA crew with its own lead and members.",
+                tools=[],
+                max_turns=1,
+            ),
+            "devops": MemberDef(
+                role="DevOps Crew",
+                prompt="Sub-crew placeholder: spawns a full devops crew with its own lead and members.",
+                tools=[],
+                max_turns=1,
+            ),
+            "security": MemberDef(
+                role="Security Crew",
+                prompt="Sub-crew placeholder: spawns a full security crew with its own lead and members.",
+                tools=[],
+                max_turns=1,
+            ),
+            "docs": MemberDef(
+                role="Docs Crew",
+                prompt="Sub-crew placeholder: spawns a full docs crew with its own lead and members.",
+                tools=[],
+                max_turns=1,
             ),
         },
     ),

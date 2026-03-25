@@ -15,7 +15,7 @@ from typing import Callable
 
 from shipwright.config import Config
 from shipwright.conversation.session import Session
-from shipwright.crew.crew import Crew, CrewStatus
+from shipwright.crew.crew import Crew, CrewStatus, EnterpriseCrew
 from shipwright.crew.registry import (
     get_crew_def,
     get_specialist_def,
@@ -178,13 +178,24 @@ class Router:
 
         project_context = self.project_info.to_prompt_context()
 
-        crew = Crew.create(
-            crew_type=crew_type,
-            crew_def=crew_def,
-            config=self.config,
-            objective=objective,
-            project_context=project_context,
-        )
+        is_enterprise = crew_type == "enterprise"
+
+        if is_enterprise:
+            crew = EnterpriseCrew.create(
+                crew_type=crew_type,
+                crew_def=crew_def,
+                config=self.config,
+                objective=objective,
+                project_context=project_context,
+            )
+        else:
+            crew = Crew.create(
+                crew_type=crew_type,
+                crew_def=crew_def,
+                config=self.config,
+                objective=objective,
+                project_context=project_context,
+            )
 
         self.crews[crew.id] = crew
         self.session.active_crew_id = crew.id
@@ -192,6 +203,17 @@ class Router:
         members = ", ".join(
             f"{m.role}" for m in crew_def.members.values()
         )
+
+        if is_enterprise:
+            return (
+                f"Hired **enterprise** crew: **{crew.id}**\n"
+                f"Objective: {objective}\n\n"
+                "**Enterprise mode** — the Project Lead will coordinate multiple sub-crews "
+                "(backend, frontend, devops, etc.) to deliver this project.\n\n"
+                "**Warning:** Enterprise mode may use 5-10x more tokens than a standard crew.\n\n"
+                "You're now talking to the Project Lead. Describe your project and they'll "
+                "propose a plan with sub-crews for your approval."
+            )
 
         return (
             f"Hired **{crew_type}** crew: **{crew.id}**\n"
@@ -260,6 +282,7 @@ class Router:
         return (
             "**Shipwright Commands**\n\n"
             f"  `hire <type> <objective>` — Hire a crew ({types})\n"
+            "  `hire enterprise <objective>` — Enterprise mode: Project Lead coordinates sub-crews\n"
             "  `fire <crew-id>` — Dismiss a crew\n"
             "  `status` — Show all active crews\n"
             "  `talk to <crew-id>` — Switch active crew\n"
@@ -434,7 +457,10 @@ class Router:
         for cid, crew_data in data.get("crews", {}).items():
             try:
                 crew_def = get_crew_def(crew_data["crew_type"], config)
-                crew = Crew.from_dict(crew_data, crew_def, config)
+                if crew_data.get("is_enterprise"):
+                    crew = EnterpriseCrew.from_dict(crew_data, crew_def, config)
+                else:
+                    crew = Crew.from_dict(crew_data, crew_def, config)
                 router.crews[cid] = crew
             except (ValueError, KeyError) as e:
                 logger.warning("Failed to restore crew %s: %s", cid, e)

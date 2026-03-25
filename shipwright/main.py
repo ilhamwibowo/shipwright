@@ -112,11 +112,15 @@ Usage:
   shipwright --discord                Run Discord bot
   shipwright "<message>"              Send a message to active crew
 
-Available crew types: fullstack, frontend, backend, qa, devops, security, docs
+Available crew types: fullstack, frontend, backend, qa, devops, security, docs, enterprise
+
+Enterprise mode (3-level hierarchy):
+  shipwright hire enterprise "Build a complete billing system"
 
 Examples:
   shipwright hire backend "Add Stripe payments"
   shipwright hire frontend "Redesign the dashboard"
+  shipwright hire enterprise "Build complete SaaS billing"
   shipwright "What's the status?"
 """)
 
