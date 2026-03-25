@@ -1,155 +1,155 @@
-# dev-agent
+# shipwright
 
-Multi-agent development pipeline that autonomously plans, implements, tests, self-corrects, reviews, and opens pull requests. Works on **any** codebase — discovers the tech stack by reading the repo.
+Virtual engineering crews powered by Claude. Hire AI dev teams that collaborate conversationally — not fire-and-forget.
 
 ## How it works
 
-Six specialized AI agents coordinated by a team lead:
-
-1. **Architect** — explores the codebase, discovers the tech stack, writes a detailed spec
-2. **Implementer** — writes code from the spec
-3. **Test Writer** — writes tests from the requirement (isolated from implementation for unbiased testing)
-4. **QA** — runs the test suite + manual exploration
-5. **Fixer** — fixes code from QA failures (never touches tests)
-6. **Reviewer** — final quality gate before PR
-
-A **Team Lead** orchestrator manages the pipeline, making adaptive decisions (add fix cycles, skip steps, stop early).
+You hire crews of specialized AI developers, talk to them conversationally, and they build your software. It's collaborative, not autonomous.
 
 ```
-User: "Add password reset to the auth flow"
-  → Architect explores repo, writes spec
-  → Implementer + Test Writer run in parallel
-  → QA runs tests, finds issues
-  → Fixer patches the code (up to 3 attempts)
-  → Reviewer approves
-  → PR opened automatically
+You: hire a backend crew to add Stripe payments
+Lead: What payment provider? Any existing payment code I should know about?
+You: Stripe. No existing code, greenfield.
+Lead: Got it. I'm having the Architect explore the codebase to understand the patterns.
+      Meanwhile, should I design for subscriptions too or just one-time?
+You: Design for subs but implement one-time first
+Lead: Smart. Architect is done — here's the proposed approach:
+      [shows spec summary]
+      Want me to proceed or adjust anything?
+You: Looks good, ship it
+Lead: Kicking off implementation...
 ```
+
+### Built-in Crews
+
+| Crew | Members |
+|------|---------|
+| **fullstack** | Architect, Frontend Dev, Backend Dev, DB Engineer |
+| **frontend** | UI Designer, React/Vue Dev, CSS Specialist |
+| **backend** | API Architect, Service Dev, DB Engineer |
+| **qa** | Test Engineer, Manual Tester, Performance Tester |
+| **devops** | Infra Engineer, CI/CD Specialist, Monitoring |
+| **security** | Security Auditor, Pen Tester |
+| **docs** | Technical Writer, API Docs Specialist |
 
 ## Installation
 
 ```bash
 pip install .
 
-# With Discord support
-pip install ".[discord]"
-
-# With dev dependencies (testing, linting)
-pip install ".[dev]"
-
-# Everything
+# With all optional deps
 pip install ".[all]"
 ```
 
-## Configuration
-
-Copy `.env.example` to `.env` and fill in your values:
-
-```bash
-cp .env.example .env
-```
-
-Required:
-- `ANTHROPIC_API_KEY` — your Anthropic API key
-
-Optional:
-- `REPO_ROOT` — path to the repo to work on (default: current directory)
-- `AGENT_MODEL` — Claude model to use (default: `claude-sonnet-4-6`)
-- `MAX_FIX_ATTEMPTS` — max QA-fix cycles (default: 3)
-- `MAX_BUDGET_PER_AGENT_USD` — token budget per agent (default: $5.00)
-- `AGENT_TIMEOUT_SECONDS` — per-agent timeout in seconds (default: 600, 0 = no timeout)
+Requires [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed locally.
 
 ## Usage
 
-### CLI Mode
+### Interactive REPL (main mode)
 
 ```bash
-# One-off request
-cd /path/to/your/project
-dev-agent "Add cancellation reasons to the order flow"
+shipwright
+```
 
-# Quick questions
-dev-agent "Explain the authentication architecture"
+### Quick commands
 
-# Testing
-dev-agent "Run the E2E tests and report any failures"
+```bash
+shipwright hire backend "Add Stripe payments"
+shipwright hire frontend "Redesign the dashboard"
+shipwright status
+shipwright fire backend-add-stripe-payments
 ```
 
 ### Telegram Bot
 
 ```bash
-# Set these in .env:
+# Set in .env:
 # TELEGRAM_BOT_TOKEN=...
 # TELEGRAM_ALLOWED_USERS=your_username
 
-dev-agent --telegram
+shipwright --telegram
 ```
-
-Talk to it like a CTO — multiple tasks run concurrently.
 
 ### Discord Bot
 
 ```bash
-# Set these in .env:
+# Set in .env:
 # DISCORD_BOT_TOKEN=...
-# DISCORD_CHANNEL_ID=...  (optional, restricts to one channel)
 
 pip install ".[discord]"
-dev-agent --discord
+shipwright --discord
 ```
 
-Commands: `!status`, `!help`
+## Custom Crews
 
-### Docker
+Define custom crews in `shipwright.yaml`:
 
-```bash
-docker build -t dev-agent .
-docker run -e ANTHROPIC_API_KEY=sk-... -v /path/to/repo:/repo -e REPO_ROOT=/repo dev-agent "your request"
+```yaml
+crews:
+  ml-crew:
+    lead: "ML engineering lead with focus on production ML systems."
+    members:
+      data_scientist:
+        role: "Data Scientist"
+        prompt: "You explore data, build models, run experiments."
+        tools: [Read, Write, Bash]
+        max_turns: 60
+      ml_engineer:
+        role: "ML Engineer"
+        prompt: "You productionize models, build pipelines, optimize inference."
+        tools: [Read, Edit, Write, Bash]
+        max_turns: 80
 ```
+
+## Configuration
+
+Environment variables (or `.env` file):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SHIPWRIGHT_MODEL` | `claude-sonnet-4-6` | Claude model to use |
+| `MAX_FIX_ATTEMPTS` | `3` | Max QA-fix cycles |
+| `TELEGRAM_BOT_TOKEN` | — | Telegram bot token |
+| `DISCORD_BOT_TOKEN` | — | Discord bot token |
 
 ## Architecture
 
 ```
-dev_agent/
-├── main.py              # Entry point (CLI, Telegram, Discord)
-├── config.py            # Configuration from .env
-├── coordinator.py       # Task orchestration, git helpers, pipeline execution
-├── persistence.py       # Save/restore task state to JSON
-├── telegram_bot.py      # Telegram long-polling bot
-├── discord_bot.py       # Discord bot
-├── notifier.py          # Notification helpers
-└── agents/
-    ├── base.py          # Agentic loop (Anthropic API + local tool execution)
-    ├── tools.py         # Tool definitions (Read, Write, Edit, Glob, Grep, Bash)
-    ├── architect.py     # Spec writer (READ-ONLY)
-    ├── implementer.py   # Code writer
-    ├── test_writer.py   # Test writer (isolated from implementation)
-    ├── qa.py            # Test runner + manual exploration
-    ├── fixer.py         # Bug fixer (never touches tests)
-    ├── reviewer.py      # Code reviewer (READ-ONLY)
-    └── team_lead.py     # Sub-coordinator for complex tasks
+shipwright/
+├── main.py              # CLI entry point
+├── config.py            # Config loading (env + shipwright.yaml)
+├── crew/                # Crew management
+│   ├── registry.py      # Built-in crew definitions
+│   ├── crew.py          # Crew class
+│   ├── member.py        # CrewMember (Claude Code SDK session)
+│   └── lead.py          # CrewLead (conversational coordinator)
+├── conversation/        # Message handling
+│   ├── session.py       # Persistent message history
+│   └── router.py        # Routes messages to crews
+├── workspace/           # Project management
+│   ├── git.py           # Git worktree isolation
+│   └── project.py       # Tech stack auto-discovery
+├── interfaces/          # User interfaces
+│   ├── cli.py           # Interactive REPL
+│   ├── telegram.py      # Telegram bot
+│   └── discord.py       # Discord bot
+└── persistence/         # State management
+    └── store.py         # Save/restore to JSON
 ```
 
 ### Key design decisions
 
-- **Tech-stack agnostic** — agents discover the project structure and conventions by reading the repo
-- **Unbiased testing** — Test Writer never sees implementation code
-- **Unidirectional fixes** — Fixer cannot modify tests; if tests fail, the code is wrong
-- **Tool restrictions** — each agent has a restricted set of tools enforced at the API level
-- **Worktree isolation** — all code changes happen in isolated git worktrees
-- **Budget tracking** — per-agent token usage tracking with configurable limits
-- **Task persistence** — state saved to JSON, survives restarts
-- **Failed pipelines push WIP branches** — humans can pick up where the agent left off
+- **Crew leads are the interface** — you never talk directly to members
+- **Members work in git worktrees** — isolation, each crew gets its own branch
+- **Conversations are persistent** — survive restarts, crews remember context
+- **Claude Code SDK** — all execution through local Claude Code, no API costs
+- **Project discovery** — auto-detects tech stack by reading the repo
 
 ## Testing
 
 ```bash
 pip install ".[dev]"
-
-# Unit tests
 pytest tests/ -v
-
-# Integration tests (requires ANTHROPIC_API_KEY)
-ANTHROPIC_API_KEY=sk-... pytest tests/integration/ -v
 ```
 
 ## License

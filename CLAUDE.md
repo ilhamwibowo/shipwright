@@ -1,36 +1,73 @@
-# dev-agent
+# shipwright
 
-Multi-agent development pipeline. Takes a requirement, autonomously
-plans, implements, tests (including browser E2E via Playwright), self-corrects,
-reviews, and opens a PR. Works on any codebase.
+Virtual engineering crews powered by Claude. Hire AI dev teams
+that collaborate conversationally — not fire-and-forget.
 
 ## Usage
 ```bash
 cd /path/to/your/project
-pip install /path/to/dev-agent
-dev-agent "Add cancellation reasons to order flow"
+pip install /path/to/shipwright
+
+# Interactive REPL
+shipwright
+
+# Quick hire
+shipwright hire backend "Add Stripe payments"
+shipwright hire frontend "Redesign the dashboard"
+
+# Status
+shipwright status
 ```
 
 ## Architecture
-Six agents coordinated by a Python orchestrator:
-1. **Architect** — explores codebase, discovers tech stack, writes spec (read-only)
-2. **Implementer** — writes code from spec
-3. **Test Writer** — writes tests from requirement (isolated from implementation)
-4. **QA** — runs tests + manual exploration
-5. **Fixer** — fixes code from QA failures (never touches tests)
-6. **Reviewer** — final quality gate
+Crew-based conversational model:
+
+```
+shipwright/
+├── main.py                  # CLI entry point
+├── config.py                # Config loading (env + shipwright.yaml)
+├── crew/
+│   ├── registry.py          # Built-in crew definitions
+│   ├── crew.py              # Crew class — manages members + conversation
+│   ├── member.py            # CrewMember — wraps a Claude Code SDK session
+│   └── lead.py              # CrewLead — the conversational coordinator
+├── conversation/
+│   ├── session.py           # Conversation session — message history, context
+│   └── router.py            # Routes user messages to the right crew
+├── workspace/
+│   ├── git.py               # Git worktree management
+│   └── project.py           # Project discovery (detect tech stack, structure)
+├── interfaces/
+│   ├── cli.py               # Interactive CLI (REPL)
+│   ├── telegram.py          # Telegram bot
+│   └── discord.py           # Discord bot
+├── persistence/
+│   └── store.py             # Save/restore crews, conversations, state
+└── utils/
+    └── logging.py           # Structured logging
+```
 
 ## Key design decisions
-- Agents discover the tech stack by reading the repo — no hardcoded assumptions
-- Test Writer never sees implementation code — tests are unbiased
-- Fixer cannot modify tests — if tests fail, the code is wrong
-- Each agent has restricted tool access enforced at the API level
-- Work happens in a git worktree for isolation
-- Failed pipelines push WIP branches so humans can pick up
-- Uses direct Anthropic API calls with tool_use (no external agent SDK)
+- **Crew model**: Users hire domain crews (backend, frontend, qa, etc.) and talk to a crew lead
+- **Conversational**: Crew leads ask clarifying questions, propose approaches, report progress
+- **Claude Code SDK**: All agent execution through `claude_code_sdk` — uses local subscription, no API costs
+- **Persistent conversations**: Crews remember context across restarts
+- **Git worktree isolation**: Each crew works on its own branch
+- **Project discovery**: Auto-detects tech stack by scanning the repo
+- **Custom crews**: Define your own in `shipwright.yaml`
+
+## Built-in crews
+- **fullstack** — Architect, Frontend Dev, Backend Dev, DB Engineer
+- **frontend** — UI Designer, React/Vue Dev, CSS Specialist
+- **backend** — API Architect, Service Dev, DB Engineer
+- **qa** — Test Engineer, Manual Tester, Performance Tester
+- **devops** — Infra Engineer, CI/CD Specialist, Monitoring
+- **security** — Security Auditor, Pen Tester
+- **docs** — Technical Writer, API Docs Specialist
 
 ## Dependencies
-- `anthropic` — Claude API client
+- `claude-code-sdk` — Claude Code SDK for agent execution
 - `httpx` — HTTP client for Telegram bot
-- `discord.py` — Discord bot (optional)
 - `python-dotenv` — .env file loading
+- `discord.py` — Discord bot (optional)
+- `pyyaml` — YAML config parsing (optional)

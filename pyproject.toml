@@ -1,12 +1,12 @@
 [project]
-name = "dev-agent"
-version = "1.0.0"
-description = "Multi-agent development pipeline — autonomous planning, implementation, testing, and PR creation"
+name = "shipwright"
+version = "2.0.0"
+description = "Virtual engineering crews powered by Claude — hire AI dev teams that collaborate conversationally"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.12"
 authors = [
-    {name = "dev-agent contributors"},
+    {name = "shipwright contributors"},
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -19,12 +19,15 @@ classifiers = [
     "Topic :: Software Development :: Testing",
 ]
 dependencies = [
-    "anthropic>=0.40.0",
+    "claude-code-sdk>=0.1.0",
     "httpx>=0.27.0",
     "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
+yaml = [
+    "pyyaml>=6.0",
+]
 telegram = []  # Uses httpx (already in core deps)
 discord = [
     "discord.py>=2.3.0",
@@ -35,14 +38,14 @@ dev = [
     "ruff>=0.4.0",
 ]
 all = [
-    "dev-agent[discord,dev]",
+    "shipwright[yaml,discord,dev]",
 ]
 
 [project.scripts]
-dev-agent = "dev_agent.main:main"
+shipwright = "shipwright.main:main"
 
 [project.urls]
-Repository = "https://github.com/your-org/dev-agent"
+Repository = "https://github.com/your-org/shipwright"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
