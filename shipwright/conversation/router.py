@@ -16,7 +16,14 @@ from typing import Callable
 from shipwright.config import Config
 from shipwright.conversation.session import Session
 from shipwright.crew.crew import Crew, CrewStatus
-from shipwright.crew.registry import get_crew_def, list_crew_types
+from shipwright.crew.registry import (
+    get_crew_def,
+    get_specialist_def,
+    inspect_crew,
+    list_crew_types,
+    list_installed,
+    list_specialists,
+)
 from shipwright.utils.logging import get_logger
 from shipwright.workspace.project import ProjectInfo, discover_project
 
@@ -137,6 +144,29 @@ class Router:
         if lower in ("ship", "pr", "open pr", "create pr"):
             return True, self._ship()
 
+        # shop / browse — list all available crews
+        if lower in ("shop", "browse", "marketplace", "available"):
+            return True, self._shop()
+
+        # installed — list custom/installed crews
+        if lower in ("installed", "plugins", "custom"):
+            return True, self._installed()
+
+        # inspect <crew>
+        inspect_match = re.match(r"^inspect\s+(.+)$", lower)
+        if inspect_match:
+            name = inspect_match.group(1).strip()
+            return True, self._inspect(name)
+
+        # recruit <specialist> into <crew>
+        recruit_match = re.match(
+            r"^recruit\s+([\w-]+)\s+(?:into|to)\s+(.+)$", lower,
+        )
+        if recruit_match:
+            specialist_name = recruit_match.group(1).strip()
+            crew_id = recruit_match.group(2).strip()
+            return True, self._recruit(specialist_name, crew_id)
+
         return False, ""
 
     def _hire_crew(self, crew_type: str, objective: str) -> str:
@@ -235,6 +265,10 @@ class Router:
             "  `talk to <crew-id>` — Switch active crew\n"
             "  `log <crew-id>` — View conversation history\n"
             "  `ship` — Open a PR for the active crew's work\n"
+            "  `shop` — Browse all available crews & specialists\n"
+            "  `installed` — List custom/installed crews\n"
+            "  `inspect <name>` — Show crew/specialist details\n"
+            "  `recruit <specialist> into <crew-id>` — Add specialist to a crew\n"
             "  `help` — Show this help\n\n"
             "Or just type naturally — messages go to the active crew lead."
         )
@@ -275,6 +309,101 @@ class Router:
         if pr_url:
             return f"PR opened: {pr_url}"
         return "Failed to open PR. Check the logs."
+
+    def _shop(self) -> str:
+        """List all available crews and specialists."""
+        lines = ["**Available Crews & Specialists**\n"]
+
+        lines.append("**Built-in Crews:**")
+        from shipwright.crew.registry import BUILTIN_CREWS
+        for name in sorted(BUILTIN_CREWS.keys()):
+            cdef = BUILTIN_CREWS[name]
+            members = ", ".join(m.role for m in cdef.members.values())
+            lines.append(f"  `{name}` — {members}")
+
+        # Custom crews
+        custom = [
+            (name, cdef) for name, cdef in self.config.custom_crews.items()
+            if name not in BUILTIN_CREWS
+        ]
+        if custom:
+            lines.append("\n**Custom Crews:**")
+            for name, cdef in sorted(custom):
+                desc = cdef.description or f"{len(cdef.members)} members"
+                lines.append(f"  `{name}` [{cdef.source}] — {desc}")
+
+        # Specialists
+        specialists = list_specialists(self.config)
+        if specialists:
+            lines.append("\n**Specialists:**")
+            for name in specialists:
+                sdef = self.config.custom_specialists[name]
+                desc = sdef.description or sdef.member_def.role
+                lines.append(f"  `{name}` [{sdef.source}] — {desc}")
+
+        lines.append(
+            "\nUse `inspect <name>` for details, "
+            "`hire <name> <objective>` to hire, "
+            "or `recruit <specialist> into <crew-id>` to add to a running crew."
+        )
+        return "\n".join(lines)
+
+    def _installed(self) -> str:
+        """List custom/installed crews and specialists."""
+        items = list_installed(self.config)
+        if not items:
+            return (
+                "No custom crews or specialists installed.\n\n"
+                "Add them to `./shipwright/crews/` or `~/.shipwright/crews/`."
+            )
+
+        lines = ["**Installed Crews & Specialists**\n"]
+        for item in items:
+            kind_tag = "crew" if item["kind"] == "crew" else "specialist"
+            desc = item["description"] or "(no description)"
+            lines.append(
+                f"  `{item['name']}` ({kind_tag}) [{item['source']}] — {desc}"
+            )
+        return "\n".join(lines)
+
+    def _inspect(self, name: str) -> str:
+        """Show detailed info about a crew or specialist."""
+        return inspect_crew(name, self.config)
+
+    def _recruit(self, specialist_name: str, crew_id: str) -> str:
+        """Recruit a specialist into an active crew."""
+        specialist = get_specialist_def(specialist_name, self.config)
+        if not specialist:
+            available = list_specialists(self.config)
+            if available:
+                return (
+                    f"Unknown specialist: '{specialist_name}'.\n"
+                    f"Available: {', '.join(available)}"
+                )
+            return (
+                f"Unknown specialist: '{specialist_name}'.\n"
+                "No specialists installed. Add them to "
+                "`./shipwright/crews/` or `~/.shipwright/crews/`."
+            )
+
+        # Find the crew (exact or partial match)
+        crew = self.crews.get(crew_id)
+        if not crew:
+            for cid, c in self.crews.items():
+                if crew_id in cid:
+                    crew = c
+                    crew_id = cid
+                    break
+
+        if not crew:
+            return f"No active crew found matching '{crew_id}'."
+
+        member_name = crew.recruit_specialist(specialist)
+        return (
+            f"Recruited **{specialist.member_def.role}** (`{member_name}`) "
+            f"into crew **{crew_id}**.\n"
+            f"The crew lead can now delegate work to `{member_name}`."
+        )
 
     def _suggest_hire(self, text: str) -> str:
         """When no active crew, suggest hiring one."""

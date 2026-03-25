@@ -16,7 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-from shipwright.config import Config, CrewDef
+from shipwright.config import Config, CrewDef, MemberDef, SpecialistDef
 from shipwright.crew.lead import CrewLead, DelegationRequest, parse_delegations
 from shipwright.crew.member import CrewMember, MemberResult
 from shipwright.utils.logging import get_logger
@@ -429,6 +429,32 @@ class Crew:
         except Exception as exc:
             logger.error("[%s] Failed to create PR: %s", self.id, exc)
             return None
+
+    def recruit_specialist(self, specialist: SpecialistDef) -> str:
+        """Add a specialist to this running crew.
+
+        Returns the member name used for the specialist.
+        """
+        member_name = specialist.name.replace("-", "_").replace(" ", "_")
+
+        # Avoid name collisions
+        if member_name in self.members or member_name in self.crew_def.members:
+            member_name = f"specialist_{member_name}"
+
+        cwd = str(self.worktree_path or self.config.repo_root)
+        self.members[member_name] = CrewMember(
+            name=member_name,
+            definition=specialist.member_def,
+            cwd=cwd,
+            model=self.crew_def.model or self.config.model,
+            permission_mode=self.config.permission_mode,
+        )
+
+        logger.info(
+            "[%s] Recruited specialist %s (%s)",
+            self.id, member_name, specialist.member_def.role,
+        )
+        return member_name
 
     def pause(self) -> None:
         self.status = CrewStatus.PAUSED

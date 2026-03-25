@@ -7,7 +7,7 @@ shipwright.yaml.
 
 from __future__ import annotations
 
-from shipwright.config import Config, CrewDef, MemberDef
+from shipwright.config import Config, CrewDef, MemberDef, SpecialistDef
 
 
 # ---------------------------------------------------------------------------
@@ -1085,11 +1085,20 @@ BUILTIN_CREWS: dict[str, CrewDef] = {
 def get_crew_def(crew_type: str, config: Config | None = None) -> CrewDef:
     """Get a crew definition by type.
 
-    Checks custom crews (from shipwright.yaml) first, then built-in definitions.
+    Resolution order:
+    1. Custom crews (project-local plugins > user-global plugins > shipwright.yaml)
+    2. Specialist auto-wrapped as a single-member crew
+    3. Built-in definitions
     """
+    # Custom crews (already merged with correct priority in config loading)
     if config and crew_type in config.custom_crews:
         return config.custom_crews[crew_type]
 
+    # Check if it's a specialist name — auto-wrap as crew
+    if config and crew_type in config.custom_specialists:
+        return specialist_as_crew(config.custom_specialists[crew_type])
+
+    # Built-in
     if crew_type in BUILTIN_CREWS:
         return BUILTIN_CREWS[crew_type]
 
@@ -1099,11 +1108,120 @@ def get_crew_def(crew_type: str, config: Config | None = None) -> CrewDef:
     )
 
 
+def specialist_as_crew(specialist: "SpecialistDef") -> CrewDef:
+    """Wrap a specialist as a single-member crew for hiring."""
+    from shipwright.config import SpecialistDef  # noqa: avoid circular at module level
+
+    member_name = specialist.name.replace("-", "_").replace(" ", "_")
+    return CrewDef(
+        name=specialist.name,
+        lead_prompt=(
+            f"You are a crew lead managing a single specialist: {specialist.member_def.role}. "
+            f"{specialist.description} "
+            "Delegate all implementation work to the specialist. "
+            "Your job is to clarify requirements, coordinate, and report results."
+        ),
+        members={member_name: specialist.member_def},
+        description=specialist.description,
+        source=specialist.source,
+    )
+
+
+def get_specialist_def(
+    name: str, config: Config | None = None,
+) -> "SpecialistDef | None":
+    """Get a specialist definition by name."""
+    if config and name in config.custom_specialists:
+        return config.custom_specialists[name]
+    return None
+
+
 def list_crew_types(config: Config | None = None) -> list[str]:
-    """List all available crew types (built-in + custom)."""
+    """List all available crew types (built-in + custom + specialists)."""
     types = list(BUILTIN_CREWS.keys())
     if config:
         for name in config.custom_crews:
             if name not in types:
                 types.append(name)
+        for name in config.custom_specialists:
+            if name not in types:
+                types.append(name)
     return sorted(types)
+
+
+def list_specialists(config: Config | None = None) -> list[str]:
+    """List all available specialist names."""
+    if not config:
+        return []
+    return sorted(config.custom_specialists.keys())
+
+
+def list_installed(config: Config | None = None) -> list[dict[str, str]]:
+    """List all custom/installed crews and specialists with metadata.
+
+    Returns a list of dicts with keys: name, kind, source, description.
+    """
+    results: list[dict[str, str]] = []
+    if not config:
+        return results
+
+    for name, cdef in config.custom_crews.items():
+        results.append({
+            "name": name,
+            "kind": "crew",
+            "source": cdef.source,
+            "description": cdef.description,
+        })
+    for name, sdef in config.custom_specialists.items():
+        results.append({
+            "name": name,
+            "kind": "specialist",
+            "source": sdef.source,
+            "description": sdef.description,
+        })
+    return sorted(results, key=lambda r: r["name"])
+
+
+def inspect_crew(crew_type: str, config: Config | None = None) -> str:
+    """Get detailed info about a crew or specialist for display."""
+    # Check specialist first
+    if config and crew_type in config.custom_specialists:
+        s = config.custom_specialists[crew_type]
+        lines = [
+            f"**{s.name}** (specialist)",
+            f"  Source: {s.source}",
+        ]
+        if s.description:
+            lines.append(f"  Description: {s.description}")
+        lines.append(f"  Role: {s.member_def.role}")
+        lines.append(f"  Tools: {', '.join(s.member_def.tools)}")
+        lines.append(f"  Max turns: {s.member_def.max_turns}")
+        if s.source_path:
+            refs_dir = s.source_path / "references"
+            if refs_dir.is_dir():
+                refs = [f.name for f in sorted(refs_dir.glob("*.md"))]
+                if refs:
+                    lines.append(f"  References: {', '.join(refs)}")
+        return "\n".join(lines)
+
+    # Check custom crews
+    crew_def = None
+    if config and crew_type in config.custom_crews:
+        crew_def = config.custom_crews[crew_type]
+    elif crew_type in BUILTIN_CREWS:
+        crew_def = BUILTIN_CREWS[crew_type]
+
+    if not crew_def:
+        return f"Unknown crew or specialist: '{crew_type}'"
+
+    lines = [
+        f"**{crew_def.name}** (crew)",
+        f"  Source: {crew_def.source}",
+    ]
+    if crew_def.description:
+        lines.append(f"  Description: {crew_def.description}")
+    lines.append(f"  Members:")
+    for mname, mdef in crew_def.members.items():
+        tools = ", ".join(mdef.tools)
+        lines.append(f"    - **{mname}** ({mdef.role}) [Tools: {tools}, Max turns: {mdef.max_turns}]")
+    return "\n".join(lines)
