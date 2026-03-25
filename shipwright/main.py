@@ -4,11 +4,11 @@
   shipwright
 
   # Quick hire
-  shipwright hire backend "Add Stripe payments"
+  shipwright hire backend-dev
 
-  # Manage crews
-  shipwright crews
+  # Manage employees
   shipwright status
+  shipwright team
 
   # Named sessions
   shipwright --session myproject
@@ -90,34 +90,43 @@ def main() -> None:
         _list_sessions(config)
         return
 
-    if args[0] == "crews" or args[0] == "status":
+    if args[0] in ("team", "status"):
         config = load_config()
         _show_status(config, session_name)
         return
 
-    if args[0] == "hire" and len(args) >= 3:
+    if args[0] == "hire" and len(args) >= 2:
         config = load_config()
-        crew_type = args[1]
-        objective = " ".join(args[2:])
+        role = args[1]
+        # Optional: hire <role> as "Name"
+        rest = " ".join(args[2:]) if len(args) > 2 else ""
         from shipwright.interfaces.cli import run_oneshot
-        asyncio.run(run_oneshot(config, f"hire {crew_type} {objective}", session_name))
+        asyncio.run(run_oneshot(config, f"hire {role} {rest}".strip(), session_name))
         return
 
     if args[0] == "talk" and len(args) >= 2:
         config = load_config()
         from shipwright.interfaces.cli import run_oneshot
-        crew_id = " ".join(args[1:])
-        asyncio.run(run_oneshot(config, f"talk to {crew_id}", session_name))
+        employee_name = args[1]
+        asyncio.run(run_oneshot(config, f"talk {employee_name}", session_name))
         return
 
     if args[0] == "fire" and len(args) >= 2:
         config = load_config()
-        crew_id = " ".join(args[1:])
+        target = args[1]
         from shipwright.interfaces.cli import run_oneshot
-        asyncio.run(run_oneshot(config, f"fire {crew_id}", session_name))
+        asyncio.run(run_oneshot(config, f"fire {target}", session_name))
         return
 
-    # Anything else is treated as a message to the active crew
+    if args[0] == "assign" and len(args) >= 3:
+        config = load_config()
+        target = args[1]
+        task = " ".join(args[2:])
+        from shipwright.interfaces.cli import run_oneshot
+        asyncio.run(run_oneshot(config, f'assign {target} "{task}"', session_name))
+        return
+
+    # Anything else is treated as a message to the active employee
     config = load_config()
     message = " ".join(args)
     from shipwright.interfaces.cli import run_oneshot
@@ -125,35 +134,52 @@ def main() -> None:
 
 
 def _print_help() -> None:
-    print("""shipwright — Virtual engineering crews powered by Claude
+    print("""shipwright — Your AI Engineering Company
 
 Usage:
-  shipwright                          Interactive REPL (main mode)
-  shipwright --session <name>         Use a named session (default: default)
-  shipwright hire <type> <objective>  Quick hire a crew
-  shipwright status                   Show active crews
-  shipwright sessions                 List all saved sessions
-  shipwright talk <crew-id>           Talk to a specific crew
-  shipwright fire <crew-id>           Dismiss a crew
-  shipwright --telegram               Run Telegram bot
-  shipwright --discord                Run Discord bot
-  shipwright "<message>"              Send a message to active crew
+  shipwright                              Interactive REPL (main mode)
+  shipwright --session <name>             Use a named session (default: default)
+  shipwright hire <role>                  Hire an employee with a role
+  shipwright hire <role> as "Name"        Hire with a custom name
+  shipwright assign <name> "<task>"       Assign work to an employee or team
+  shipwright talk <name>                  Talk to a specific employee
+  shipwright fire <name>                  Fire an employee
+  shipwright status                       Show company status
+  shipwright team                         Show team overview
+  shipwright sessions                     List all saved sessions
+  shipwright --telegram                   Run Telegram bot
+  shipwright --discord                    Run Discord bot
+  shipwright "<message>"                  Send a message to active employee
 
-Session management (in REPL):
-  sessions                            List all saved sessions
-  session save <name>                 Save current state as a named session
-  session load <name>                 Load a named session
-  session clear                       Clear current session state
+REPL commands:
+  roles                                   List available roles to hire
+  hire <role>                             Hire an employee
+  fire <name>                             Fire an employee or team
+  team                                    Show company overview
+  team create <name>                      Create a team
+  promote <name> to lead of <team>        Promote to team lead
+  assign <name|team> "<task>"             Assign work
+  assign <name> to <team>                 Add employee to team
+  talk <name>                             Switch conversation to employee
+  status                                  Company overview
+  costs                                   Budget/token usage per employee
+  history <name>                          Task history for an employee
+  ship                                    Open PR for all work
+  ship <team>                             Open PR for team's work
+  save                                    Save current state
+  sessions                                List all saved sessions
+  session save <name>                     Save as named session
+  session load <name>                     Load a named session
+  session clear                           Clear current session
 
-Available crew types: fullstack, frontend, backend, qa, devops, security, docs, enterprise
-
-Enterprise mode (3-level hierarchy):
-  shipwright hire enterprise "Build a complete billing system"
+Available roles: architect, backend-dev, frontend-dev, fullstack-dev,
+  db-engineer, qa-engineer, devops-engineer, security-auditor,
+  tech-writer, designer, team-lead, vp-engineering
 
 Examples:
-  shipwright hire backend "Add Stripe payments"
-  shipwright hire frontend "Redesign the dashboard"
-  shipwright --session myproject hire backend "Add payments"
+  shipwright hire backend-dev
+  shipwright assign Alex "Add Stripe payments"
+  shipwright --session myproject hire architect
   shipwright "What's the status?"
 """)
 
@@ -164,17 +190,24 @@ def _show_status(config: "Config", session_name: str = "default") -> None:
 
     saved = load_state(config, session_id=session_name)
     if not saved:
-        print("No active crews.")
+        print("No active employees.")
         return
 
     router = Router.from_dict(saved, config)
-    if not router.crews:
-        print("No active crews.")
+    if not router.company or not router.company.employees:
+        print("No active employees.")
         return
 
-    for crew in router.crews.values():
-        print(crew.summary)
-        print()
+    company = router.company
+    n_employees = len(company.employees)
+    n_teams = len(company.teams)
+    header = f"Your Company ({n_employees} employee(s)"
+    if n_teams:
+        header += f", {n_teams} team(s)"
+    header += ")"
+    print(header)
+    print(company.status_summary)
+    print()
 
 
 def _list_sessions(config: "Config") -> None:

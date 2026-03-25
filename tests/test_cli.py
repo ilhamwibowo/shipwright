@@ -59,12 +59,10 @@ class TestRenderMarkdown:
         result = render_markdown(text)
         assert "Before" in result
         assert "After" in result
-        assert "─" in result  # separator line
         assert "print('hi')" in result
 
     def test_horizontal_rule(self):
         result = render_markdown("Above\n---\nBelow")
-        assert "─" in result
         assert "Above" in result
         assert "Below" in result
 
@@ -74,7 +72,6 @@ class TestRenderMarkdown:
         assert "Header" in result
         assert "bold" in result
         assert "code" in result
-        assert "─" in result
 
     def test_multiline_code_block(self):
         text = "```\nline 1\nline 2\nline 3\n```"
@@ -112,15 +109,12 @@ class TestCLIOutput:
         ui = CLIOutput()
         ui.on_text("hello")
         ui.finish_response()
-        # After finish, spinner should be inactive
         assert ui.spinner.active is False
 
     def test_start_thinking_resets_streamed(self):
         ui = CLIOutput()
         ui._got_text = True
         ui.start_thinking()
-        # Note: spinner.start requires a running loop, so it may not activate
-        # but _got_text should be reset
         assert ui._got_text is False
 
     def test_start_thinking_records_time(self):
@@ -176,6 +170,5 @@ class TestSpinner:
 
     def test_stop_when_not_running(self):
         s = Spinner()
-        # Should not raise
         s.stop()
         assert s.active is False

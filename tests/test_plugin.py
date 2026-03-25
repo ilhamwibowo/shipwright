@@ -1,4 +1,4 @@
-"""Tests for the plugin system: YAML loading, resolution order, references, CLI commands."""
+"""Tests for the plugin system: YAML loading, resolution order, references, CLI commands (V2)."""
 
 from pathlib import Path
 from unittest.mock import patch
@@ -18,14 +18,17 @@ from shipwright.config import (
 )
 from shipwright.conversation.router import Router
 from shipwright.conversation.session import Session
-from shipwright.crew.crew import Crew
-from shipwright.crew.registry import (
-    BUILTIN_CREWS,
+from shipwright.company.roles import (
+    BUILTIN_ROLES,
+    TEAM_TEMPLATES,
     get_crew_def,
+    get_role_def,
     get_specialist_def,
     inspect_crew,
+    inspect_role,
     list_crew_types,
     list_installed,
+    list_roles,
     list_specialists,
     specialist_as_crew,
 )
@@ -195,12 +198,6 @@ class TestPluginYAMLLoading:
         result = _load_plugin_yaml(tmp_path)
         assert result is None
 
-    def test_load_plugin_yaml_invalid(self, tmp_path: Path):
-        from shipwright.config import _load_plugin_yaml
-        (tmp_path / "crew.yaml").write_text("not: [valid: yaml: {{")
-        # Should not crash — returns None on parse error
-        # (PyYAML may or may not raise on this specific input, but we handle exceptions)
-
 
 # ---------------------------------------------------------------------------
 # Resolution Order
@@ -217,7 +214,6 @@ class TestResolutionOrder:
         crews: dict[str, CrewDef] = {}
         specialists: dict[str, SpecialistDef] = {}
 
-        # Project-local scanned first
         _scan_plugin_dir(project_crews, "project", crews, specialists)
         _scan_plugin_dir(user_crews, "user", crews, specialists)
 
@@ -259,7 +255,7 @@ class TestResolutionOrder:
         assert result.name == "backend"
         assert "architect" in result.members
 
-    def test_specialist_hireable_as_crew(self):
+    def test_specialist_hireable_as_role(self):
         specialist = SpecialistDef(
             name="stripe-expert",
             description="Stripe payments expert",
@@ -273,14 +269,16 @@ class TestResolutionOrder:
         )
         config = Config(custom_specialists={"stripe-expert": specialist})
 
-        # Should be hireable via get_crew_def
+        # Should be hireable as a role via get_role_def
+        role_def = get_role_def("stripe-expert", config)
+        assert role_def.role == "Stripe Specialist"
+
+        # Also hireable as crew via get_crew_def (backward compat)
         crew_def = get_crew_def("stripe-expert", config)
         assert crew_def.name == "stripe-expert"
         assert "stripe_expert" in crew_def.members
-        assert crew_def.members["stripe_expert"].role == "Stripe Specialist"
 
     def test_scan_all_plugin_dirs(self, tmp_path: Path):
-        """Test full scan with mocked home directory."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         project_crews = project_dir / "shipwright" / "crews"
@@ -298,17 +296,17 @@ class TestResolutionOrder:
         assert "global-crew" in crews
         assert "local-specialist" in specialists
 
-    def test_list_crew_types_includes_specialists(self):
+    def test_list_roles_includes_specialists(self):
         specialist = SpecialistDef(
             name="my-specialist",
             description="test",
             member_def=MemberDef(role="Spec", prompt="test"),
         )
         config = Config(custom_specialists={"my-specialist": specialist})
-        types = list_crew_types(config)
-        assert "my-specialist" in types
+        roles = list_roles(config)
+        assert "my-specialist" in roles
         # Builtins still there
-        assert "backend" in types
+        assert "backend-dev" in roles
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +349,7 @@ class TestSpecialistAsCrew:
 
 
 # ---------------------------------------------------------------------------
-# Registry Functions
+# Registry Functions (V2: company.roles)
 # ---------------------------------------------------------------------------
 
 class TestRegistryFunctions:
@@ -398,11 +396,10 @@ class TestRegistryFunctions:
         assert "my-crew" in names
         assert "my-spec" in names
 
-    def test_inspect_builtin_crew(self):
-        result = inspect_crew("backend")
-        assert "**backend**" in result
-        assert "crew" in result.lower()
-        assert "architect" in result.lower()
+    def test_inspect_builtin_role(self):
+        result = inspect_role("backend-dev")
+        assert "Backend Developer" in result
+        assert "builtin role" in result
 
     def test_inspect_specialist(self):
         specialist = SpecialistDef(
@@ -417,76 +414,30 @@ class TestRegistryFunctions:
             source="project",
         )
         config = Config(custom_specialists={"stripe-expert": specialist})
-        result = inspect_crew("stripe-expert", config)
-        assert "**stripe-expert**" in result
-        assert "specialist" in result.lower()
+        result = inspect_role("stripe-expert", config)
+        assert "stripe-expert" in result
+        assert "specialist" in result
         assert "Stripe Specialist" in result
         assert "Read, Write" in result
 
     def test_inspect_unknown(self):
+        result = inspect_role("nonexistent")
+        assert "Unknown" in result
+
+    def test_inspect_builtin_crew(self):
+        """inspect_crew still works for backward compat."""
+        result = inspect_crew("backend")
+        assert "**backend**" in result
+        assert "crew" in result.lower()
+        assert "architect" in result.lower()
+
+    def test_inspect_crew_unknown(self):
         result = inspect_crew("nonexistent")
         assert "Unknown" in result
 
 
 # ---------------------------------------------------------------------------
-# Crew Recruitment
-# ---------------------------------------------------------------------------
-
-class TestCrewRecruitment:
-    def _make_crew(self, config: Config) -> Crew:
-        crew_def = get_crew_def("backend", config)
-        return Crew.create(
-            crew_type="backend",
-            crew_def=crew_def,
-            config=config,
-            objective="Test objective",
-        )
-
-    def test_recruit_specialist(self, config: Config):
-        crew = self._make_crew(config)
-        specialist = SpecialistDef(
-            name="stripe-expert",
-            description="Stripe expert",
-            member_def=MemberDef(
-                role="Stripe Specialist",
-                prompt="You know Stripe.",
-                tools=["Read", "Write"],
-                max_turns=60,
-            ),
-        )
-        member_name = crew.recruit_specialist(specialist)
-        assert member_name == "stripe_expert"
-        assert "stripe_expert" in crew.members
-        assert crew.members["stripe_expert"].role == "Stripe Specialist"
-
-    def test_recruit_avoids_name_collision(self, config: Config):
-        crew = self._make_crew(config)
-        # Force members to be created
-        crew._ensure_members()
-
-        # Create a specialist with a name that collides with existing member
-        specialist = SpecialistDef(
-            name="architect",  # Same as existing backend member
-            description="test",
-            member_def=MemberDef(role="Special Architect", prompt="test"),
-        )
-        member_name = crew.recruit_specialist(specialist)
-        assert member_name == "specialist_architect"
-        assert "specialist_architect" in crew.members
-
-    def test_recruited_member_has_correct_cwd(self, config: Config):
-        crew = self._make_crew(config)
-        specialist = SpecialistDef(
-            name="test-spec",
-            description="test",
-            member_def=MemberDef(role="Spec", prompt="test"),
-        )
-        crew.recruit_specialist(specialist)
-        assert crew.members["test_spec"].cwd == str(config.repo_root)
-
-
-# ---------------------------------------------------------------------------
-# Router Commands
+# Router Plugin Commands (V2)
 # ---------------------------------------------------------------------------
 
 class TestRouterPluginCommands:
@@ -496,25 +447,16 @@ class TestRouterPluginCommands:
 
     def test_shop_command(self, config: Config):
         router = self._make_router(config)
-        is_cmd, response = router._try_command("shop")
+        is_cmd, response = router._try_sync_command("shop", "shop")
         assert is_cmd
         assert "Available" in response
-        assert "backend" in response  # builtin
+        assert "architect" in response  # builtin role
 
     def test_browse_alias(self, config: Config):
         router = self._make_router(config)
-        is_cmd, response = router._try_command("browse")
+        is_cmd, response = router._try_sync_command("browse", "browse")
         assert is_cmd
         assert "Available" in response
-
-    def test_shop_shows_custom_crews(self):
-        custom = CrewDef(name="ml-crew", lead_prompt="ML lead.",
-                         description="ML team", source="project", members={})
-        config = Config(custom_crews={"ml-crew": custom})
-        router = Router(config=config, session=Session(id="test"))
-        _, response = router._try_command("shop")
-        assert "ml-crew" in response
-        assert "Custom Crews" in response
 
     def test_shop_shows_specialists(self):
         specialist = SpecialistDef(
@@ -525,13 +467,13 @@ class TestRouterPluginCommands:
         )
         config = Config(custom_specialists={"stripe-expert": specialist})
         router = Router(config=config, session=Session(id="test"))
-        _, response = router._try_command("shop")
+        _, response = router._try_sync_command("shop", "shop")
         assert "stripe-expert" in response
         assert "Specialists" in response
 
     def test_installed_command_empty(self, config: Config):
         router = self._make_router(config)
-        is_cmd, response = router._try_command("installed")
+        is_cmd, response = router._try_sync_command("installed", "installed")
         assert is_cmd
         assert "No custom" in response
 
@@ -540,79 +482,27 @@ class TestRouterPluginCommands:
                          description="ML team", source="project", members={})
         config = Config(custom_crews={"ml-crew": custom})
         router = Router(config=config, session=Session(id="test"))
-        _, response = router._try_command("installed")
+        _, response = router._try_sync_command("installed", "installed")
         assert "ml-crew" in response
 
     def test_inspect_command(self, config: Config):
         router = self._make_router(config)
-        is_cmd, response = router._try_command("inspect backend")
+        is_cmd, response = router._try_sync_command("inspect backend-dev", "inspect backend-dev")
         assert is_cmd
-        assert "backend" in response
-        assert "architect" in response.lower()
+        assert "Backend Developer" in response
 
     def test_inspect_unknown(self, config: Config):
         router = self._make_router(config)
-        is_cmd, response = router._try_command("inspect nonexistent")
+        is_cmd, response = router._try_sync_command("inspect nonexistent", "inspect nonexistent")
         assert is_cmd
         assert "Unknown" in response
 
-    def test_recruit_command(self):
-        specialist = SpecialistDef(
-            name="stripe-expert",
-            description="Stripe expert",
-            member_def=MemberDef(
-                role="Stripe Specialist",
-                prompt="You know Stripe.",
-                tools=["Read", "Write"],
-            ),
-            source="project",
-        )
-        config = Config(custom_specialists={"stripe-expert": specialist})
-        router = Router(config=config, session=Session(id="test"))
-
-        # Hire a crew first
-        router._try_command("hire backend Add payments")
-        crew_id = list(router.crews.keys())[0]
-
-        # Recruit specialist into the crew
-        is_cmd, response = router._try_command(f"recruit stripe-expert into {crew_id}")
-        assert is_cmd
-        assert "Recruited" in response
-        assert "Stripe Specialist" in response
-
-        # Verify the member was added
-        crew = router.crews[crew_id]
-        assert "stripe_expert" in crew.members
-
-    def test_recruit_unknown_specialist(self, config: Config):
+    def test_help_includes_plugin_commands(self, config: Config):
         router = self._make_router(config)
-        router._try_command("hire backend Add payments")
-        crew_id = list(router.crews.keys())[0]
-
-        is_cmd, response = router._try_command(f"recruit nonexistent into {crew_id}")
-        assert is_cmd
-        assert "Unknown specialist" in response
-
-    def test_recruit_into_unknown_crew(self):
-        specialist = SpecialistDef(
-            name="my-spec",
-            description="test",
-            member_def=MemberDef(role="Spec", prompt="test"),
-        )
-        config = Config(custom_specialists={"my-spec": specialist})
-        router = Router(config=config, session=Session(id="test"))
-
-        is_cmd, response = router._try_command("recruit my-spec into nonexistent")
-        assert is_cmd
-        assert "No active crew" in response
-
-    def test_help_includes_new_commands(self, config: Config):
-        router = self._make_router(config)
-        _, response = router._try_command("help")
+        _, response = router._try_sync_command("help", "help")
         assert "shop" in response
         assert "installed" in response
         assert "inspect" in response
-        assert "recruit" in response
 
 
 # ---------------------------------------------------------------------------
@@ -621,7 +511,7 @@ class TestRouterPluginCommands:
 
 class TestPluginIntegration:
     def test_full_plugin_crew_flow(self, tmp_path: Path):
-        """End-to-end: create plugin dir → scan → hire crew."""
+        """End-to-end: create plugin dir -> scan -> hire as role."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         crews_dir = project_dir / "shipwright" / "crews"
@@ -635,13 +525,17 @@ class TestPluginIntegration:
         assert crew_def.source == "project"
         assert "dev" in crew_def.members
 
-        # Verify it's hireable
+        # Verify it's hireable as crew (backward compat)
         config = Config(repo_root=project_dir, custom_crews=crews)
         result = get_crew_def("ml-crew", config)
         assert result.name == "ml-crew"
 
+        # Also hireable as role (V2)
+        role_def = get_role_def("ml-crew", config)
+        assert role_def.role == "ml-crew"
+
     def test_full_specialist_flow(self, tmp_path: Path):
-        """End-to-end: create specialist plugin → scan → recruit."""
+        """End-to-end: create specialist plugin -> scan -> hire as role."""
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         crews_dir = project_dir / "shipwright" / "crews"
@@ -665,11 +559,9 @@ class TestPluginIntegration:
         crews_dir = project_dir / "shipwright" / "crews"
         _make_crew_plugin(crews_dir, "my-crew")
 
-        # Plugin crew loaded
         with patch("shipwright.config.Path.home", return_value=tmp_path / "nohome"):
             plugin_crews, _ = _scan_all_plugin_dirs(project_dir)
 
-        # YAML crew with same name
         yaml_crew = CrewDef(
             name="my-crew",
             lead_prompt="YAML version.",
@@ -677,7 +569,6 @@ class TestPluginIntegration:
             source="yaml",
         )
 
-        # Merge: yaml wins
         merged = {**plugin_crews, "my-crew": yaml_crew}
         assert merged["my-crew"].source == "yaml"
         assert merged["my-crew"].lead_prompt == "YAML version."

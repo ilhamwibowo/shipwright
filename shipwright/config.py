@@ -33,6 +33,7 @@ class CrewDef:
     model: str | None = None
     description: str = ""
     source: str = "builtin"
+    budget_limit_usd: float = 0.0  # per-crew budget (0 = use global)
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,9 @@ class Config:
     max_fix_attempts: int = 3
     model: str = "claude-sonnet-4-6"
     permission_mode: str = "bypassPermissions"
+
+    # Budget limit (0 = no limit)
+    budget_limit_usd: float = 0.0
 
     # Custom crew defs from shipwright.yaml
     custom_crews: dict[str, CrewDef] = field(default_factory=dict)
@@ -101,6 +105,7 @@ def _parse_crew_defs(raw: dict[str, Any]) -> dict[str, CrewDef]:
             lead_prompt=cdef.get("lead", f"You are the {name} crew lead."),
             members=members,
             model=cdef.get("model"),
+            budget_limit_usd=float(cdef.get("budget_limit", 0)),
         )
     return crews
 
@@ -133,6 +138,7 @@ def _load_yaml_config(repo_root: Path) -> dict[str, CrewDef]:
             model=cdef.model,
             description=cdef.description,
             source="yaml",
+            budget_limit_usd=cdef.budget_limit_usd,
         )
     return crews
 
@@ -315,6 +321,7 @@ def load_config() -> Config:
         max_fix_attempts=int(os.environ.get("MAX_FIX_ATTEMPTS", "3")),
         model=os.environ.get("SHIPWRIGHT_MODEL", "claude-sonnet-4-6"),
         permission_mode=os.environ.get("SHIPWRIGHT_PERMISSION_MODE", "bypassPermissions"),
+        budget_limit_usd=float(os.environ.get("BUDGET_LIMIT_USD", "0")),
         custom_crews=merged_crews,
         custom_specialists=plugin_specialists,
     )

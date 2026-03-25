@@ -1,13 +1,16 @@
-"""Built-in crew definitions and custom crew loading.
+"""Built-in role definitions for Shipwright V2.
 
-The registry provides pre-defined crew types (fullstack, frontend, backend,
-qa, devops, security, docs) and merges in any custom definitions from
-shipwright.yaml.
+Instead of crew-based definitions, V2 uses individual roles that employees
+can be hired for.  Team templates (the old "crews") are preserved for
+backward compatibility with plugins and the ``hire <crew-type>`` shorthand.
 """
 
 from __future__ import annotations
 
 from shipwright.config import Config, CrewDef, MemberDef, SpecialistDef
+
+# V2 alias — a role definition is structurally identical to a member def.
+RoleDef = MemberDef
 
 
 # ---------------------------------------------------------------------------
@@ -960,11 +963,188 @@ full crew.
 """
 
 
+# ========================== FULLSTACK DEV (V2 combined role) ==========================
+
+_FULLSTACK_DEV_PROMPT = """\
+You are a senior fullstack developer. You work across the entire stack — frontend, \
+backend, and database — with equal proficiency. You are the go-to engineer when \
+a feature touches multiple layers and someone needs to own the whole thing end-to-end.
+
+## Your Engineering Philosophy
+- Simplicity wins. The best code is code that doesn't exist. Every abstraction \
+has a maintenance cost — it must earn its keep.
+- Every function does one thing. If you need a comment explaining "this part \
+does X and then Y," that's two functions.
+- Error handling is not an afterthought. Handle every failure case explicitly. \
+Never catch-and-silence. Never return null when you mean "not found."
+- Tests aren't optional. If it's not tested, it's broken. Write tests that \
+describe behavior, not implementation.
+- Performance matters, but correctness matters more. Optimize only with data: \
+profile first, then fix the actual bottleneck.
+
+## Backend Patterns You Follow
+- Repository/service pattern for data access — business logic never touches \
+the database directly. SQL never appears in route handlers.
+- Dependency injection for testability. If it's hard to test, the design is wrong.
+- Structured logging with context (request ID, user ID) — never bare print().
+- Database migrations are immutable once deployed. Add columns, don't rename. \
+Backfill with scripts, don't modify migrations.
+- API versioning from day one. Breaking changes get a new version.
+- Input validation at the boundary, business validation in the service layer.
+
+## Backend Anti-Patterns You Reject
+- God objects / classes that do everything. If a class has 10+ methods, split it.
+- Business logic in controllers. Controllers parse input, call services, \
+format output. That's it.
+- Catching exceptions to silence them. If you catch, handle or re-raise.
+- Raw SQL without parameterization — SQL injection is a solved problem.
+- Hardcoded configuration. Use environment variables or config objects.
+- Returning HTTP 200 with {"error": "..."} — use proper status codes.
+
+## Frontend Patterns You Follow
+- The component tree is your architecture. Get the component boundaries right \
+and everything else follows. Get them wrong and you'll be refactoring forever.
+- State belongs in exactly one place. If you're syncing state between two \
+components, something is wrong with your data flow.
+- Accessibility is not a nice-to-have. Semantic HTML first, ARIA only when \
+HTML falls short. Every interactive element is keyboard-navigable.
+- Collocate related code: component, styles, tests, types in the same directory.
+- API calls go through a data layer (hooks, services), never raw fetch in \
+components.
+
+## Frontend Anti-Patterns You Reject
+- Prop drilling through 4+ levels — use context or composition instead.
+- useEffect for derived state. If it can be computed from existing state, \
+compute it. Don't sync it.
+- Div soup. If it's a list, use <ul>. If it's a heading, use <h2>. Semantic \
+elements exist for a reason.
+- Components that accept 15+ props. That's a page, not a component. Break it up.
+
+## Database Instincts
+- Normalize first, denormalize only with measured evidence.
+- Every table has a clear primary key, created_at, and updated_at. Every \
+foreign key has an index. No exceptions.
+- Constraints belong in the database, not just the application.
+- Use transactions for multi-step operations. No inconsistent intermediate states.
+
+## Code Review Standards
+- No unused imports or dead code. Delete, don't comment out.
+- Error messages are actionable: include what went wrong, what was expected, \
+and what to do about it.
+- No TODO without an issue reference. Untracked TODOs are permanent.
+- Test names describe behavior: test_returns_404_when_user_not_found, not \
+test_get_user_3.
+"""
+
+
 # ---------------------------------------------------------------------------
-# Built-in crew definitions
+# V2 Built-in role definitions
 # ---------------------------------------------------------------------------
 
-BUILTIN_CREWS: dict[str, CrewDef] = {
+BUILTIN_ROLES: dict[str, MemberDef] = {
+    "architect": MemberDef(
+        role="Architect",
+        prompt=_FULLSTACK_ARCHITECT,
+        tools=["Read", "Glob", "Grep", "Write", "Bash"],
+        max_turns=40,
+    ),
+    "backend-dev": MemberDef(
+        role="Backend Developer",
+        prompt=_FULLSTACK_BACKEND,
+        tools=["Read", "Edit", "Write", "Glob", "Grep", "Bash"],
+        max_turns=80,
+    ),
+    "frontend-dev": MemberDef(
+        role="Frontend Developer",
+        prompt=_FULLSTACK_FRONTEND + "\n\n" + _FRONTEND_CSS,
+        tools=["Read", "Edit", "Write", "Glob", "Grep", "Bash"],
+        max_turns=80,
+    ),
+    "fullstack-dev": MemberDef(
+        role="Fullstack Developer",
+        prompt=_FULLSTACK_DEV_PROMPT,
+        tools=["Read", "Edit", "Write", "Glob", "Grep", "Bash"],
+        max_turns=80,
+    ),
+    "db-engineer": MemberDef(
+        role="DB Engineer",
+        prompt=_FULLSTACK_DB,
+        tools=["Read", "Edit", "Write", "Bash"],
+        max_turns=40,
+    ),
+    "qa-engineer": MemberDef(
+        role="QA Engineer",
+        prompt=_QA_TEST_ENGINEER,
+        tools=["Read", "Write", "Glob", "Grep", "Bash"],
+        max_turns=60,
+    ),
+    "devops-engineer": MemberDef(
+        role="DevOps Engineer",
+        prompt=_DEVOPS_INFRA,
+        tools=["Read", "Edit", "Write", "Glob", "Grep", "Bash"],
+        max_turns=60,
+    ),
+    "security-auditor": MemberDef(
+        role="Security Auditor",
+        prompt=_SECURITY_AUDITOR,
+        tools=["Read", "Glob", "Grep", "Write"],
+        max_turns=50,
+    ),
+    "tech-writer": MemberDef(
+        role="Tech Writer",
+        prompt=_DOCS_TECH_WRITER,
+        tools=["Read", "Write", "Glob", "Grep"],
+        max_turns=40,
+    ),
+    "designer": MemberDef(
+        role="Designer",
+        prompt=_FRONTEND_DESIGNER,
+        tools=["Read", "Glob", "Grep", "Write"],
+        max_turns=30,
+    ),
+    "team-lead": MemberDef(
+        role="Team Lead",
+        prompt=(
+            "You are a Team Lead. Your specific coordination prompt will be "
+            "set dynamically based on your team."
+        ),
+        tools=["Read", "Glob", "Grep"],
+        max_turns=20,
+    ),
+    "vp-engineering": MemberDef(
+        role="VP Engineering",
+        prompt=_ENTERPRISE_PROJECT_LEAD,
+        tools=["Read", "Glob", "Grep"],
+        max_turns=20,
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
+# Display name lookup
+# ---------------------------------------------------------------------------
+
+ROLE_DISPLAY_NAMES: dict[str, str] = {
+    "architect": "Architect",
+    "backend-dev": "Backend Developer",
+    "frontend-dev": "Frontend Developer",
+    "fullstack-dev": "Fullstack Developer",
+    "db-engineer": "DB Engineer",
+    "qa-engineer": "QA Engineer",
+    "devops-engineer": "DevOps Engineer",
+    "security-auditor": "Security Auditor",
+    "tech-writer": "Tech Writer",
+    "designer": "Designer",
+    "team-lead": "Team Lead",
+    "vp-engineering": "VP Engineering",
+}
+
+
+# ---------------------------------------------------------------------------
+# Team templates (backward compat — formerly BUILTIN_CREWS)
+# ---------------------------------------------------------------------------
+
+TEAM_TEMPLATES: dict[str, CrewDef] = {
     "fullstack": CrewDef(
         name="fullstack",
         lead_prompt=_FULLSTACK_LEAD,
@@ -1178,14 +1358,68 @@ BUILTIN_CREWS: dict[str, CrewDef] = {
     ),
 }
 
+# Backward-compat alias
+BUILTIN_CREWS = TEAM_TEMPLATES
+
+
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+
+def get_role_def(role_id: str, config: Config | None = None) -> MemberDef:
+    """Get a role definition by ID.
+
+    Resolution order:
+    1. Custom specialists (project-local > user-global plugins)
+    2. Custom crews treated as roles (lead becomes the role)
+    3. Built-in roles
+    """
+    # 1. Custom specialists
+    if config and role_id in config.custom_specialists:
+        return config.custom_specialists[role_id].member_def
+
+    # 2. Custom crews — treat the crew lead prompt as a role
+    if config and role_id in config.custom_crews:
+        cdef = config.custom_crews[role_id]
+        return MemberDef(
+            role=cdef.name,
+            prompt=cdef.lead_prompt,
+            tools=["Read", "Glob", "Grep"],
+            max_turns=50,
+            model=cdef.model,
+        )
+
+    # 3. Built-in roles
+    if role_id in BUILTIN_ROLES:
+        return BUILTIN_ROLES[role_id]
+
+    available = list_roles(config)
+    raise ValueError(
+        f"Unknown role: '{role_id}'. Available: {', '.join(available)}"
+    )
+
+
+def list_roles(config: Config | None = None) -> list[str]:
+    """List all available role IDs."""
+    roles = list(BUILTIN_ROLES.keys())
+    if config:
+        for name in config.custom_specialists:
+            if name not in roles:
+                roles.append(name)
+        for name in config.custom_crews:
+            if name not in roles:
+                roles.append(name)
+    return sorted(roles)
+
 
 def get_crew_def(crew_type: str, config: Config | None = None) -> CrewDef:
-    """Get a crew definition by type.
+    """Get a crew definition by type (backward compat with team templates).
 
     Resolution order:
     1. Custom crews (project-local plugins > user-global plugins > shipwright.yaml)
     2. Specialist auto-wrapped as a single-member crew
-    3. Built-in definitions
+    3. Built-in team templates
     """
     # Custom crews (already merged with correct priority in config loading)
     if config and crew_type in config.custom_crews:
@@ -1195,9 +1429,9 @@ def get_crew_def(crew_type: str, config: Config | None = None) -> CrewDef:
     if config and crew_type in config.custom_specialists:
         return specialist_as_crew(config.custom_specialists[crew_type])
 
-    # Built-in
-    if crew_type in BUILTIN_CREWS:
-        return BUILTIN_CREWS[crew_type]
+    # Built-in team templates
+    if crew_type in TEAM_TEMPLATES:
+        return TEAM_TEMPLATES[crew_type]
 
     available = list_crew_types(config)
     raise ValueError(
@@ -1205,10 +1439,8 @@ def get_crew_def(crew_type: str, config: Config | None = None) -> CrewDef:
     )
 
 
-def specialist_as_crew(specialist: "SpecialistDef") -> CrewDef:
+def specialist_as_crew(specialist: SpecialistDef) -> CrewDef:
     """Wrap a specialist as a single-member crew for hiring."""
-    from shipwright.config import SpecialistDef  # noqa: avoid circular at module level
-
     member_name = specialist.name.replace("-", "_").replace(" ", "_")
     return CrewDef(
         name=specialist.name,
@@ -1226,7 +1458,7 @@ def specialist_as_crew(specialist: "SpecialistDef") -> CrewDef:
 
 def get_specialist_def(
     name: str, config: Config | None = None,
-) -> "SpecialistDef | None":
+) -> SpecialistDef | None:
     """Get a specialist definition by name."""
     if config and name in config.custom_specialists:
         return config.custom_specialists[name]
@@ -1234,8 +1466,8 @@ def get_specialist_def(
 
 
 def list_crew_types(config: Config | None = None) -> list[str]:
-    """List all available crew types (built-in + custom + specialists)."""
-    types = list(BUILTIN_CREWS.keys())
+    """List all available crew types (built-in templates + custom + specialists)."""
+    types = list(TEAM_TEMPLATES.keys())
     if config:
         for name in config.custom_crews:
             if name not in types:
@@ -1279,8 +1511,46 @@ def list_installed(config: Config | None = None) -> list[dict[str, str]]:
     return sorted(results, key=lambda r: r["name"])
 
 
+def inspect_role(role_id: str, config: Config | None = None) -> str:
+    """Get detailed info about a role for display."""
+    # Check specialist first
+    if config and role_id in config.custom_specialists:
+        s = config.custom_specialists[role_id]
+        lines = [
+            f"**{s.name}** (specialist)",
+            f"  Source: {s.source}",
+        ]
+        if s.description:
+            lines.append(f"  Description: {s.description}")
+        lines.append(f"  Role: {s.member_def.role}")
+        lines.append(f"  Tools: {', '.join(s.member_def.tools)}")
+        lines.append(f"  Max turns: {s.member_def.max_turns}")
+        if s.source_path:
+            refs_dir = s.source_path / "references"
+            if refs_dir.is_dir():
+                refs = [f.name for f in sorted(refs_dir.glob("*.md"))]
+                if refs:
+                    lines.append(f"  References: {', '.join(refs)}")
+        return "\n".join(lines)
+
+    # Check built-in roles
+    if role_id in BUILTIN_ROLES:
+        rdef = BUILTIN_ROLES[role_id]
+        display = ROLE_DISPLAY_NAMES.get(role_id, rdef.role)
+        lines = [
+            f"**{display}** (builtin role)",
+            f"  ID: {role_id}",
+            f"  Role: {rdef.role}",
+            f"  Tools: {', '.join(rdef.tools)}",
+            f"  Max turns: {rdef.max_turns}",
+        ]
+        return "\n".join(lines)
+
+    return f"Unknown role: '{role_id}'"
+
+
 def inspect_crew(crew_type: str, config: Config | None = None) -> str:
-    """Get detailed info about a crew or specialist for display."""
+    """Get detailed info about a crew or specialist for display (backward compat)."""
     # Check specialist first
     if config and crew_type in config.custom_specialists:
         s = config.custom_specialists[crew_type]
@@ -1305,8 +1575,8 @@ def inspect_crew(crew_type: str, config: Config | None = None) -> str:
     crew_def = None
     if config and crew_type in config.custom_crews:
         crew_def = config.custom_crews[crew_type]
-    elif crew_type in BUILTIN_CREWS:
-        crew_def = BUILTIN_CREWS[crew_type]
+    elif crew_type in TEAM_TEMPLATES:
+        crew_def = TEAM_TEMPLATES[crew_type]
 
     if not crew_def:
         return f"Unknown crew or specialist: '{crew_type}'"

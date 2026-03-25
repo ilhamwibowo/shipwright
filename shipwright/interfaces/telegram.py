@@ -1,6 +1,6 @@
 """Telegram bot interface for Shipwright.
 
-Conversational interface via Telegram. Supports multiple concurrent crews,
+Conversational interface via Telegram. Supports multiple concurrent employees,
 persistent state, and all router commands.
 """
 
@@ -157,13 +157,15 @@ class TelegramBot:
         if text.startswith("/start"):
             self._send(
                 chat_id,
-                "<b>Shipwright — Virtual Engineering Crews</b>\n\n"
-                "Talk to me like a CTO. Examples:\n\n"
-                "- <code>hire backend Add Stripe payments</code>\n"
-                "- <code>hire frontend Redesign the dashboard</code>\n"
+                "<b>Shipwright — Your AI Engineering Company</b>\n\n"
+                "Hire AI employees and manage your engineering team. Examples:\n\n"
+                "- <code>hire backend-dev</code>\n"
+                "- <code>assign Alex \"Add Stripe payments\"</code>\n"
+                "- <code>roles</code>\n"
+                "- <code>team</code>\n"
                 "- <code>status</code>\n"
                 "- <code>help</code>\n\n"
-                "I manage multiple crews at once.",
+                "I manage your AI employees across roles and teams.",
                 message_id,
             )
             return

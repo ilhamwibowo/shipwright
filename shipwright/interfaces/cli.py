@@ -1,6 +1,6 @@
 """Interactive CLI REPL — the primary interface for Shipwright.
 
-Provides a conversational terminal interface where users can hire crews,
+Provides a conversational terminal interface where users can hire employees,
 chat with them, check status, and manage their virtual engineering company.
 """
 
@@ -15,8 +15,8 @@ import time
 from shipwright.config import Config
 from shipwright.conversation.router import Router
 from shipwright.conversation.session import Session
-from shipwright.crew.crew import CrewStatus
-from shipwright.crew.registry import list_crew_types
+from shipwright.company.employee import EmployeeStatus
+from shipwright.company.roles import list_roles
 from shipwright.persistence.store import load_state, save_state
 from shipwright.utils.logging import get_logger
 
@@ -50,29 +50,36 @@ BANNER = f"""\
 |_____/|_| |_|_| .__/   \\_/\\_/ |_|  |_|\\__, |_| |_|\\__|
                | |                       __/ |
                |_|                      |___/{RESET}
-  {DIM}Virtual engineering crews powered by Claude{RESET}
+  {DIM}Your AI Engineering Company{RESET}
 
-  Type {BOLD}help{RESET} for commands, or {BOLD}hire <type> <objective>{RESET} to get started.
+  Type {BOLD}help{RESET} for commands, or {BOLD}hire <role>{RESET} to get started.
 """
 
 # Commands recognised by the REPL (for tab completion)
 _COMMANDS = [
-    "crews",
+    "assign",
+    "costs",
     "exit",
     "fire",
     "help",
     "hire",
-    "log",
-    "pr",
+    "history",
+    "inspect",
+    "installed",
+    "promote",
     "quit",
+    "roles",
+    "save",
     "session clear",
     "session load",
     "session save",
     "sessions",
     "ship",
+    "shop",
     "status",
-    "switch to",
-    "talk to",
+    "talk",
+    "team",
+    "team create",
 ]
 
 
@@ -82,7 +89,7 @@ _COMMANDS = [
 class Spinner:
     """Async braille-pattern spinner shown while waiting for SDK responses."""
 
-    _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _FRAMES = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
 
     def __init__(self) -> None:
         self._active = False
@@ -149,7 +156,7 @@ class CLIOutput:
     def on_delegation_start(
         self, member_name: str, task: str, round_num: int, max_rounds: int
     ) -> None:
-        """Called when a crew member starts working."""
+        """Called when an employee starts working."""
         if self.spinner.active:
             self.spinner.stop()
         # Ensure we reset color from any prior lead text
@@ -158,7 +165,7 @@ class CLIOutput:
         short_task = task.split("\n")[0][:60]
         round_tag = f" [round {round_num}]" if round_num > 1 else ""
         sys.stdout.write(
-            f"\n  {YELLOW}⚙️{round_tag} {role} is working: "
+            f"\n  {YELLOW}\u2699\ufe0f{round_tag} {role} is working: "
             f"{short_task}...{RESET}\n"
         )
         sys.stdout.flush()
@@ -167,15 +174,15 @@ class CLIOutput:
     def on_delegation_end(
         self, member_name: str, duration_s: float, is_error: bool
     ) -> None:
-        """Called when a crew member finishes."""
+        """Called when an employee finishes."""
         if self.spinner.active:
             self.spinner.stop()
         role = member_name.replace("_", " ").title()
         if is_error:
-            sys.stdout.write(f"  {RED}✗ {role} failed ({duration_s:.1f}s){RESET}\n")
+            sys.stdout.write(f"  {RED}\u2717 {role} failed ({duration_s:.1f}s){RESET}\n")
         else:
             sys.stdout.write(
-                f"  {GREEN}✓ {role} done ({duration_s:.1f}s){RESET}\n"
+                f"  {GREEN}\u2713 {role} done ({duration_s:.1f}s){RESET}\n"
             )
         sys.stdout.flush()
 
@@ -231,7 +238,7 @@ def render_markdown(text: str) -> str:
         # Code block toggle
         if stripped.startswith("```"):
             in_code_block = not in_code_block
-            output.append(f"  {DIM}{'─' * 50}{RESET}")
+            output.append(f"  {DIM}{'\u2500' * 50}{RESET}")
             continue
 
         if in_code_block:
@@ -240,7 +247,7 @@ def render_markdown(text: str) -> str:
 
         # Horizontal rule
         if stripped and len(stripped) >= 3 and all(c in "-*_" for c in stripped):
-            output.append(f"  {DIM}{'─' * 50}{RESET}")
+            output.append(f"  {DIM}{'\u2500' * 50}{RESET}")
             continue
 
         # Headers
@@ -286,27 +293,28 @@ def _setup_readline(config: Config) -> None:
 
 
 def _setup_completer(router: Router) -> None:
-    """Set up tab completion for commands and crew names."""
+    """Set up tab completion for commands and employee names."""
     if not HAS_READLINE:
         return
 
-    crew_types = list_crew_types(router.config)
+    roles = list_roles(router.config)
+    employee_names = list(router.company.employees.keys()) if router.company else []
 
     def completer(text: str, state: int) -> str | None:
         line = readline.get_line_buffer().lstrip()
         options: list[str] = []
 
         if not line or line == text:
-            # First word — suggest commands and crew types
+            # First word — suggest commands and roles
             options = [c for c in _COMMANDS if c.startswith(text.lower())]
-            options.extend(t for t in crew_types if t.startswith(text.lower()))
+            options.extend(r for r in roles if r.startswith(text.lower()))
         else:
             first_word = line.split()[0].lower()
-            if first_word in ("hire", "start", "create"):
-                options = [t for t in crew_types if t.startswith(text.lower())]
-            elif first_word in ("fire", "dismiss", "talk", "switch", "log"):
+            if first_word in ("hire",):
+                options = [r for r in roles if r.startswith(text.lower())]
+            elif first_word in ("fire", "talk", "assign", "promote", "history"):
                 options = [
-                    cid for cid in router.crews if text.lower() in cid.lower()
+                    n for n in employee_names if text.lower() in n.lower()
                 ]
 
         return options[state] if state < len(options) else None
@@ -337,31 +345,30 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
     if saved:
         router = Router.from_dict(saved, config)
         router.session_name = session_name
-        if router.crews:
-            print(f"  Restored {len(router.crews)} crew(s) from previous session.")
+        if router.company and router.company.employees:
+            n = len(router.company.employees)
+            print(f"  Restored {n} employee(s) from previous session.")
             if session_name != "default":
                 print(f"  Session: {session_name}")
             # Show stale worktree warnings
-            for crew in router.crews.values():
-                if crew.is_stale:
-                    print(
-                        f"  {YELLOW}Warning: {crew.id} worktree no longer exists "
-                        f"(marked stale){RESET}"
-                    )
-            # Show active crew info
-            if router.active_crew:
-                active = router.active_crew
+            if router.company.is_stale:
                 print(
-                    f"  Active crew: {active.id} [{active.status.value}]"
+                    f"  {YELLOW}Warning: company worktree no longer exists "
+                    f"(marked stale){RESET}"
                 )
-                print(f"  Objective: {active.objective}")
+            # Show active employee info
+            active = router.company.active_employee
+            if active:
+                print(
+                    f"  Active: {active.name} ({active.display_role}) [{active.status.value}]"
+                )
             print()
     else:
         router = Router(config=config, session=session, session_name=session_name)
 
-    # Show available crew types
-    types = list_crew_types(config)
-    print(f"  Available crews: {', '.join(types)}\n")
+    # Show available roles
+    roles = list_roles(config)
+    print(f"  Available roles: {', '.join(roles)}\n")
 
     # Setup readline
     _setup_readline(config)
@@ -371,11 +378,11 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
 
     while True:
         try:
-            # Build prompt with crew status
-            active = router.active_crew
+            # Build prompt with active employee status
+            active = router.company.active_employee if router.company else None
             if active:
                 status = active.status.value
-                prompt = f"{CYAN}[{active.id}|{status}]{RESET} > "
+                prompt = f"{CYAN}[{active.name}/{active.display_role}|{status}]{RESET} > "
             else:
                 prompt = f"{CYAN}shipwright{RESET} > "
 
@@ -388,10 +395,6 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
                 save_state(router.to_dict(), config, session_id=router.session_name)
                 print(f"\n  {DIM}State saved. Goodbye!{RESET}")
                 break
-
-            # Alias: 'crews' -> 'status'
-            if line.lower() == "crews":
-                line = "status"
 
             # Process the message
             try:
@@ -424,9 +427,9 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
 
             except KeyboardInterrupt:
                 ui.finish_response()
-                # Reset crew status if it was mid-work
-                if active and active.status == CrewStatus.WORKING:
-                    active.status = CrewStatus.IDLE
+                # Reset employee status if it was mid-work
+                if active and active.status == EmployeeStatus.WORKING:
+                    active.status = EmployeeStatus.IDLE
                 print(f"\n  {DIM}Cancelled.{RESET}\n")
                 continue
             except asyncio.CancelledError:
@@ -437,7 +440,7 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
             # Auto-save after each interaction
             save_state(router.to_dict(), config, session_id=router.session_name)
 
-            # Refresh completer with potentially new crews
+            # Refresh completer with potentially new employees
             _setup_completer(router)
 
         except KeyboardInterrupt:

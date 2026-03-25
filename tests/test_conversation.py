@@ -1,4 +1,4 @@
-"""Tests for conversation session and router."""
+"""Tests for conversation session and router (V2)."""
 
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,12 +14,13 @@ from shipwright.conversation.session import Message, Session
 # Session
 # ---------------------------------------------------------------------------
 
+
 class TestSession:
     def test_add_messages(self):
         session = Session(id="test")
         session.add_user_message("hello")
         session.add_lead_message("hi there", crew_id="backend-1")
-        session.add_system_message("Crew hired.")
+        session.add_system_message("Employee hired.")
 
         assert len(session.messages) == 3
         assert session.messages[0].role == "user"
@@ -57,8 +58,8 @@ class TestSession:
     def test_serialization(self):
         session = Session(id="test")
         session.add_user_message("hello")
-        session.add_lead_message("hi", crew_id="crew-1")
-        session.active_crew_id = "crew-1"
+        session.add_lead_message("hi", crew_id="emp-1")
+        session.active_crew_id = "emp-1"
 
         data = session.to_dict()
         assert data["id"] == "test"
@@ -67,7 +68,7 @@ class TestSession:
         restored = Session.from_dict(data)
         assert restored.id == "test"
         assert len(restored.messages) == 2
-        assert restored.active_crew_id == "crew-1"
+        assert restored.active_crew_id == "emp-1"
 
 
 class TestMessage:
@@ -77,17 +78,18 @@ class TestMessage:
         assert msg.timestamp > 0
 
     def test_message_roundtrip(self):
-        msg = Message(role="lead", text="response", crew_id="crew-1")
+        msg = Message(role="lead", text="response", crew_id="emp-1")
         data = msg.to_dict()
         restored = Message.from_dict(data)
         assert restored.role == "lead"
         assert restored.text == "response"
-        assert restored.crew_id == "crew-1"
+        assert restored.crew_id == "emp-1"
 
 
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------
+
 
 class TestRouter:
     def _make_router(self, config: Config) -> Router:
@@ -96,104 +98,212 @@ class TestRouter:
 
     def test_help_command(self, config: Config):
         router = self._make_router(config)
-        is_cmd, response = router._try_command("help")
+        is_cmd, response = router._try_sync_command("help", "help")
         assert is_cmd
         assert "Commands" in response
 
-    def test_status_no_crews(self, config: Config):
+    def test_roles_command(self, config: Config):
         router = self._make_router(config)
-        is_cmd, response = router._try_command("status")
+        is_cmd, response = router._try_sync_command("roles", "roles")
         assert is_cmd
-        assert "No active crews" in response
+        assert "Available Roles" in response
+        assert "architect" in response
+        assert "backend-dev" in response
 
     def test_hire_command(self, config: Config):
         router = self._make_router(config)
-        is_cmd, response = router._try_command("hire backend Add Stripe payments")
+        is_cmd, response = router._try_sync_command("hire backend-dev", "hire backend-dev")
         assert is_cmd
         assert "Hired" in response
-        assert "backend" in response
-        assert len(router.crews) == 1
-        assert router.session.active_crew_id is not None
+        assert len(router.company.employees) == 1
 
-    def test_hire_unknown_type(self, config: Config):
+    def test_hire_with_custom_name(self, config: Config):
         router = self._make_router(config)
-        is_cmd, response = router._try_command("hire nonexistent do stuff")
+        is_cmd, response = router._try_sync_command(
+            'hire backend-dev as "Kai"', 'hire backend-dev as "kai"',
+        )
         assert is_cmd
-        assert "Unknown crew type" in response
+        assert "Kai" in response
+        assert "Kai" in router.company.employees
+
+    def test_hire_unknown_role(self, config: Config):
+        router = self._make_router(config)
+        is_cmd, response = router._try_sync_command("hire nonexistent", "hire nonexistent")
+        assert is_cmd
+        assert "Unknown role" in response
 
     def test_fire_command(self, config: Config):
         router = self._make_router(config)
-        router._try_command("hire backend Add payments")
-        crew_id = list(router.crews.keys())[0]
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
+        emp_name = list(router.company.employees.keys())[0]
 
-        is_cmd, response = router._try_command(f"fire {crew_id}")
+        is_cmd, response = router._try_sync_command(f"fire {emp_name}", f"fire {emp_name.lower()}")
         assert is_cmd
         assert "Fired" in response
-        assert len(router.crews) == 0
+        assert len(router.company.employees) == 0
 
-    def test_switch_crew(self, config: Config):
+    def test_team_create_command(self, config: Config):
         router = self._make_router(config)
-        router._try_command("hire backend Add payments")
-        router._try_command("hire frontend Build dashboard")
-
-        crew_ids = list(router.crews.keys())
-        first_id = crew_ids[0]
-
-        is_cmd, response = router._try_command(f"talk to {first_id}")
+        is_cmd, response = router._try_sync_command("team create backend", "team create backend")
         assert is_cmd
-        assert router.session.active_crew_id == first_id
+        assert "Created team" in response
+        assert "backend" in router.company.teams
 
-    def test_status_with_crews(self, config: Config):
+    def test_promote_command(self, config: Config):
         router = self._make_router(config)
-        router._try_command("hire backend Add payments")
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
+        emp_name = list(router.company.employees.keys())[0]
+        router._try_sync_command("team create core", "team create core")
 
-        is_cmd, response = router._try_command("status")
+        is_cmd, response = router._try_sync_command(
+            f"promote {emp_name} to lead of core",
+            f"promote {emp_name.lower()} to lead of core",
+        )
         assert is_cmd
-        assert "Active Crews" in response
+        assert "Team Lead" in response
 
-    def test_no_crew_suggests_hire(self, config: Config):
+    def test_assign_to_team_command(self, config: Config):
+        router = self._make_router(config)
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
+        emp_name = list(router.company.employees.keys())[0]
+        router._try_sync_command("team create core", "team create core")
+
+        # This goes through handle_message (async path) for "assign X to Y"
+        # but _try_sync_command won't match. It's parsed in handle_message.
+        # Test the direct method instead:
+        response = router._assign_to_team_cmd(emp_name, "core")
+        assert "added to team" in response
+
+    def test_talk_command(self, config: Config):
+        router = self._make_router(config)
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
+        router._try_sync_command("hire frontend-dev", "hire frontend-dev")
+        emp_names = list(router.company.employees.keys())
+
+        is_cmd, response = router._try_sync_command(
+            f"talk {emp_names[1]}", f"talk {emp_names[1].lower()}",
+        )
+        assert is_cmd
+        assert "Now talking" in response
+
+    def test_status_command(self, config: Config):
+        router = self._make_router(config)
+        is_cmd, response = router._try_sync_command("status", "status")
+        assert is_cmd
+        assert "No employees" in response
+
+    def test_status_with_employees(self, config: Config):
+        router = self._make_router(config)
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
+
+        is_cmd, response = router._try_sync_command("status", "status")
+        assert is_cmd
+        assert "Your Company" in response
+
+    def test_costs_command(self, config: Config):
+        router = self._make_router(config)
+        is_cmd, response = router._try_sync_command("costs", "costs")
+        assert is_cmd
+        assert "Cost Report" in response
+
+    def test_cost_aliases(self, config: Config):
+        router = self._make_router(config)
+        for cmd in ("costs", "cost", "spending", "budget"):
+            is_cmd, _ = router._try_sync_command(cmd, cmd)
+            assert is_cmd, f"Command '{cmd}' not recognized"
+
+    def test_history_command(self, config: Config):
+        router = self._make_router(config)
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
+        emp_name = list(router.company.employees.keys())[0]
+
+        is_cmd, response = router._try_sync_command(
+            f"history {emp_name}", f"history {emp_name.lower()}",
+        )
+        assert is_cmd
+        assert "No task history" in response
+
+    def test_shop_command(self, config: Config):
+        router = self._make_router(config)
+        is_cmd, response = router._try_sync_command("shop", "shop")
+        assert is_cmd
+        assert "Available" in response
+        assert "architect" in response
+
+    def test_installed_command(self, config: Config):
+        router = self._make_router(config)
+        is_cmd, response = router._try_sync_command("installed", "installed")
+        assert is_cmd
+        assert "No custom" in response
+
+    def test_inspect_command(self, config: Config):
+        router = self._make_router(config)
+        is_cmd, response = router._try_sync_command("inspect backend-dev", "inspect backend-dev")
+        assert is_cmd
+        assert "Backend Developer" in response
+
+    def test_inspect_unknown(self, config: Config):
+        router = self._make_router(config)
+        is_cmd, response = router._try_sync_command("inspect nonexistent", "inspect nonexistent")
+        assert is_cmd
+        assert "Unknown" in response
+
+    def test_sessions_command(self, config: Config):
+        router = self._make_router(config)
+        is_cmd, response = router._try_sync_command("sessions", "sessions")
+        assert is_cmd
+        assert "No saved sessions" in response
+
+    def test_team_overview_command(self, config: Config):
+        router = self._make_router(config)
+        is_cmd, response = router._try_sync_command("team", "team")
+        assert is_cmd
+        assert "No employees" in response
+
+    def test_no_employee_suggests_hire(self, config: Config):
         router = self._make_router(config)
         response = router._suggest_hire("do something")
         assert "hire" in response.lower()
+        assert "roles" in response.lower()
 
-    def test_natural_hire_patterns(self, config: Config):
-        router = self._make_router(config)
 
-        # "hire a backend crew for X"
-        is_cmd, _ = router._try_command("hire a backend crew for payments")
-        assert is_cmd
+# ---------------------------------------------------------------------------
+# Router Serialization
+# ---------------------------------------------------------------------------
 
-    def test_crew_log_command(self, config: Config):
-        router = self._make_router(config)
-        router._try_command("hire backend Add payments")
-        crew_id = list(router.crews.keys())[0]
 
-        is_cmd, response = router._try_command(f"log {crew_id}")
-        assert is_cmd
-        # No messages yet
-        assert "No conversation" in response
-
-    def test_router_serialization(self, config: Config):
-        router = self._make_router(config)
-        router._try_command("hire backend Add payments")
+class TestRouterSerialization:
+    def test_to_dict_from_dict_round_trip(self, config: Config):
+        session = Session(id="test")
+        router = Router(config=config, session=session, session_name="myproject")
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
         router.session.add_user_message("hello")
 
         data = router.to_dict()
         assert "session" in data
-        assert "crews" in data
-        assert len(data["crews"]) == 1
+        assert "company" in data
+        assert data["session_name"] == "myproject"
 
         restored = Router.from_dict(data, config)
-        assert len(restored.crews) == 1
+        assert len(restored.company.employees) == 1
+        assert restored.session_name == "myproject"
         assert len(restored.session.messages) >= 1
 
-    def test_partial_crew_match(self, config: Config):
-        router = self._make_router(config)
-        router._try_command("hire backend Add payments")
-        crew_id = list(router.crews.keys())[0]
+    def test_empty_router_round_trip(self, config: Config):
+        session = Session(id="test")
+        router = Router(config=config, session=session)
 
-        # Partial match should work
-        partial = crew_id[:10]
-        is_cmd, response = router._try_command(f"talk to {partial}")
-        assert is_cmd
-        assert "Now talking" in response
+        data = router.to_dict()
+        restored = Router.from_dict(data, config)
+        assert len(restored.company.employees) == 0
+
+    def test_backward_compat_old_crew_state(self, config: Config):
+        """Old crew-based state is ignored gracefully."""
+        data = {
+            "session": {"id": "test", "messages": [], "active_crew_id": None},
+            "crews": {"some-crew-id": {"crew_type": "backend", "objective": "Test"}},
+            "session_name": "test",
+        }
+        restored = Router.from_dict(data, config)
+        # Old crew data is ignored; company is empty
+        assert len(restored.company.employees) == 0

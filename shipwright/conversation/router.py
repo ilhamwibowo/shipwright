@@ -1,10 +1,6 @@
-"""Router — handles user messages across multiple active crews.
+"""Router — handles user messages for the Shipwright V2 company model.
 
-The router is the central message handler. It:
-- Manages multiple active crews
-- Parses commands (hire, fire, status, etc.)
-- Routes conversational messages to the active crew
-- Provides the glue between interfaces and crews
+Routes commands and conversational messages through the Company.
 """
 
 from __future__ import annotations
@@ -15,13 +11,16 @@ from typing import Callable
 
 from shipwright.config import Config
 from shipwright.conversation.session import Session
-from shipwright.crew.crew import Crew, CrewStatus, EnterpriseCrew
-from shipwright.crew.registry import (
-    get_crew_def,
+from shipwright.company.company import Company
+from shipwright.company.employee import Employee, EmployeeStatus
+from shipwright.company.roles import (
+    BUILTIN_ROLES,
+    ROLE_DISPLAY_NAMES,
+    get_role_def,
     get_specialist_def,
-    inspect_crew,
-    list_crew_types,
+    inspect_role,
     list_installed,
+    list_roles,
     list_specialists,
 )
 from shipwright.persistence.store import (
@@ -38,17 +37,20 @@ logger = get_logger("conversation.router")
 
 @dataclass
 class Router:
-    """Routes user messages to the right crew.
+    """Routes user messages to the right employee/team.
 
-    Manages the lifecycle of crews: hiring, chatting, firing, and listing.
-    Each session (CLI, Telegram channel, Discord channel) gets its own router.
+    Manages the lifecycle of the company: hiring, firing, team management,
+    work assignment, and conversation routing.
     """
 
     config: Config
     session: Session
-    crews: dict[str, Crew] = field(default_factory=dict)
+    company: Company = field(init=False)
     session_name: str = "default"
     _project_info: ProjectInfo | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.company = Company(config=self.config)
 
     @property
     def project_info(self) -> ProjectInfo:
@@ -56,12 +58,9 @@ class Router:
             self._project_info = discover_project(self.config.repo_root)
         return self._project_info
 
-    @property
-    def active_crew(self) -> Crew | None:
-        """Get the currently active crew."""
-        if self.session.active_crew_id:
-            return self.crews.get(self.session.active_crew_id)
-        return None
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
 
     async def handle_message(
         self,
@@ -73,8 +72,10 @@ class Router:
     ) -> str:
         """Process a user message and return the response.
 
-        Handles commands (hire, fire, status, etc.) and routes
-        conversational messages to the active crew.
+        The dispatch order is:
+        1. Async commands that need ``await`` (assign work, ship)
+        2. Synchronous commands (hire, fire, status, ...)
+        3. Conversational fallback — route to the active employee
         """
         text = text.strip()
         if not text:
@@ -82,311 +83,409 @@ class Router:
 
         self.session.add_user_message(text)
 
-        # Check for commands
-        command, response = self._try_command(text)
+        # Ensure project context is populated
+        if not self.company.project_context:
+            self.company.project_context = self.project_info.to_prompt_context()
+
+        lower = text.lower().strip()
+
+        # ---- 1. Async: assign work -----------------------------------------
+        # "assign <target> to <team>" — team membership (sync, handled below)
+        # "assign <target> "<task>"" or "assign <target> <task>" — work (async)
+
+        assign_match = re.match(
+            r'^assign\s+(\w+)\s+"([^"]+)"$', text, re.IGNORECASE,
+        )
+        if not assign_match:
+            # Try unquoted form, but disambiguate from "assign X to Y"
+            assign_match2 = re.match(
+                r'^assign\s+(\w+)\s+(.+)$', text, re.IGNORECASE,
+            )
+            if assign_match2:
+                target = assign_match2.group(1)
+                rest = assign_match2.group(2).strip()
+                # "assign X to Y" → team membership (handled in sync branch)
+                to_match = re.match(r'^to\s+(.+)$', rest, re.IGNORECASE)
+                if to_match:
+                    team_name = to_match.group(1).strip()
+                    response = self._assign_to_team_cmd(target, team_name)
+                    self.session.add_system_message(response)
+                    return response
+                # Otherwise it's a work assignment
+                assign_match = assign_match2
+
+        if assign_match:
+            target = assign_match.group(1)
+            task_desc = assign_match.group(2).strip().strip('"')
+            resolved = self._resolve_name(target)
+            if not resolved:
+                response = f"No employee or team named '{target}'."
+                self.session.add_system_message(response)
+                return response
+            try:
+                response = await self.company.assign_work(
+                    resolved,
+                    task_desc,
+                    on_text=on_text,
+                    on_delegation_start=on_delegation_start,
+                    on_delegation_end=on_delegation_end,
+                    on_progress=on_progress,
+                )
+                self.session.add_lead_message(response, crew_id=resolved)
+                return response
+            except ValueError as e:
+                response = str(e)
+                self.session.add_system_message(response)
+                return response
+
+        # ---- 2. Async: ship / pr -------------------------------------------
+        if lower.startswith("ship") or lower in ("pr", "open pr", "create pr"):
+            parts = text.split(maxsplit=1)
+            target = (
+                parts[1].strip()
+                if len(parts) > 1 and parts[0].lower() == "ship"
+                else None
+            )
+            response = await self._ship(target)
+            self.session.add_system_message(response)
+            return response
+
+        # ---- 3. Synchronous commands ----------------------------------------
+        command, response = self._try_sync_command(text, lower)
         if command:
             self.session.add_system_message(response)
             return response
 
-        # Route to active crew
-        crew = self.active_crew
-        if not crew:
-            # Try to auto-detect intent
+        # ---- 4. Conversational fallback — route to active employee ----------
+        employee = self.company.active_employee
+        if not employee:
             response = self._suggest_hire(text)
             self.session.add_system_message(response)
             return response
 
-        # Chat with the active crew
-        response = await crew.chat(
-            user_message=text,
+        response = await self.company.talk(
+            employee.name,
+            text,
             on_text=on_text,
             on_delegation_start=on_delegation_start,
             on_delegation_end=on_delegation_end,
             on_progress=on_progress,
         )
-        self.session.add_lead_message(response, crew_id=crew.id)
+        self.session.add_lead_message(response, crew_id=employee.name)
         return response
 
-    def _try_command(self, text: str) -> tuple[bool, str]:
-        """Try to parse text as a command. Returns (is_command, response)."""
-        lower = text.lower().strip()
+    # ------------------------------------------------------------------
+    # Sync command dispatcher
+    # ------------------------------------------------------------------
 
-        # hire <crew_type> <objective>
+    def _try_sync_command(self, text: str, lower: str) -> tuple[bool, str]:
+        """Try synchronous commands. Returns (is_command, response)."""
+
+        # roles
+        if lower in ("roles", "available roles"):
+            return True, self._roles()
+
+        # hire <role> [as "Name"]
         hire_match = re.match(
-            r"^(?:hire|start|create)\s+(?:a\s+)?(\w+)(?:\s+crew)?\s+(?:for\s+|to\s+)?(.+)$",
-            lower, re.IGNORECASE,
+            r'^(?:hire)\s+([\w-]+)(?:\s+as\s+"([^"]+)"|\s+as\s+(\S+))?$',
+            text,
+            re.IGNORECASE,
         )
         if hire_match:
-            crew_type = hire_match.group(1)
-            objective = text[hire_match.start(2):]  # preserve original casing
-            return True, self._hire_crew(crew_type, objective)
+            role_id = hire_match.group(1).lower()
+            custom_name = hire_match.group(2) or hire_match.group(3)
+            return True, self._hire(role_id, custom_name)
 
-        # fire <crew_id>
-        fire_match = re.match(r"^(?:fire|dismiss|stop|remove)\s+(.+)$", lower)
+        # fire <name>
+        fire_match = re.match(r'^(?:fire|dismiss)\s+(.+)$', lower)
         if fire_match:
-            crew_id = fire_match.group(1).strip()
-            return True, self._fire_crew(crew_id)
+            target = fire_match.group(1).strip()
+            return True, self._fire(target)
+
+        # team overview
+        if lower in ("team", "teams", "company", "org"):
+            return True, self._team_overview()
+
+        # team create <name>
+        team_create_match = re.match(r'^team\s+create\s+(.+)$', lower)
+        if team_create_match:
+            return True, self._team_create(team_create_match.group(1).strip())
+
+        # promote <name> to lead of <team>
+        promote_match = re.match(
+            r'^promote\s+(\w+)\s+to\s+lead\s+of\s+(.+)$', text, re.IGNORECASE,
+        )
+        if promote_match:
+            return True, self._promote(
+                promote_match.group(1), promote_match.group(2).strip(),
+            )
+
+        # talk <name>
+        talk_match = re.match(
+            r'^(?:talk|talk\s+to|switch\s+to)\s+(\w+)$', text, re.IGNORECASE,
+        )
+        if talk_match:
+            return True, self._talk(talk_match.group(1))
 
         # status
-        if lower in ("status", "crews", "list", "board", "what's happening", "whats happening"):
+        if lower in ("status", "overview", "board"):
             return True, self._status()
 
-        # talk to <crew_id>
-        talk_match = re.match(r"^(?:talk\s+to|switch\s+to|use)\s+(.+)$", lower)
-        if talk_match:
-            crew_id = talk_match.group(1).strip()
-            return True, self._switch_crew(crew_id)
+        # costs
+        if lower in ("costs", "cost", "spending", "budget"):
+            return True, self._costs()
+
+        # history <name>
+        history_match = re.match(r'^(?:history|log)\s+(\w+)$', lower)
+        if history_match:
+            return True, self._history(history_match.group(1))
 
         # help
         if lower in ("help", "?", "commands"):
             return True, self._help()
 
-        # log <crew_id>
-        log_match = re.match(r"^(?:log|history)\s+(.+)$", lower)
-        if log_match:
-            crew_id = log_match.group(1).strip()
-            return True, self._crew_log(crew_id)
-
-        # ship / pr
-        if lower in ("ship", "pr", "open pr", "create pr"):
-            return True, self._ship()
-
-        # shop / browse — list all available crews
-        if lower in ("shop", "browse", "marketplace", "available"):
-            return True, self._shop()
-
-        # installed — list custom/installed crews
-        if lower in ("installed", "plugins", "custom"):
-            return True, self._installed()
-
-        # inspect <crew>
-        inspect_match = re.match(r"^inspect\s+(.+)$", lower)
-        if inspect_match:
-            name = inspect_match.group(1).strip()
-            return True, self._inspect(name)
-
-        # recruit <specialist> into <crew>
-        recruit_match = re.match(
-            r"^recruit\s+([\w-]+)\s+(?:into|to)\s+(.+)$", lower,
-        )
-        if recruit_match:
-            specialist_name = recruit_match.group(1).strip()
-            crew_id = recruit_match.group(2).strip()
-            return True, self._recruit(specialist_name, crew_id)
-
-        # sessions / session list
+        # sessions
         if lower in ("sessions", "session list"):
             return True, self._list_sessions()
 
-        # session save <name>
-        session_save_match = re.match(r"^session\s+save\s+(.+)$", lower)
+        session_save_match = re.match(r'^(?:session\s+save|save)\s+(.+)$', lower)
         if session_save_match:
-            name = text[len("session save "):].strip()
-            return True, self._session_save(name)
+            return True, self._session_save(session_save_match.group(1).strip())
 
-        # session load <name>
-        session_load_match = re.match(r"^session\s+load\s+(.+)$", lower)
+        if lower == "save":
+            return True, self._session_save(self.session_name)
+
+        session_load_match = re.match(r'^session\s+load\s+(.+)$', lower)
         if session_load_match:
-            name = text[len("session load "):].strip()
-            return True, self._session_load(name)
+            return True, self._session_load(text[len("session load "):].strip())
 
-        # session clear
         if lower in ("session clear", "session reset"):
             return True, self._session_clear()
 
+        # shop / installed / inspect
+        if lower in ("shop", "browse", "marketplace", "available"):
+            return True, self._shop()
+
+        if lower in ("installed", "plugins", "custom"):
+            return True, self._installed()
+
+        inspect_match = re.match(r'^inspect\s+(.+)$', lower)
+        if inspect_match:
+            return True, self._inspect(inspect_match.group(1).strip())
+
         return False, ""
 
-    def _hire_crew(self, crew_type: str, objective: str) -> str:
-        """Hire a new crew."""
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_name(self, name: str) -> str | None:
+        """Resolve a case-insensitive name to an employee or team name."""
+        # Exact match first
+        if name in self.company.employees:
+            return name
+        if name in self.company.teams:
+            return name
+        # Case-insensitive
+        for emp_name in self.company.employees:
+            if emp_name.lower() == name.lower():
+                return emp_name
+        for team_name in self.company.teams:
+            if team_name.lower() == name.lower():
+                return team_name
+        return None
+
+    # ------------------------------------------------------------------
+    # Command implementations
+    # ------------------------------------------------------------------
+
+    def _roles(self) -> str:
+        """List all available roles."""
+        roles = list_roles(self.config)
+        builtin = [r for r in roles if r in BUILTIN_ROLES]
+        custom = [r for r in roles if r not in BUILTIN_ROLES]
+
+        lines = ["**Available Roles**\n"]
+        for r in sorted(builtin):
+            display = ROLE_DISPLAY_NAMES.get(r, r)
+            lines.append(f"  `{r}` — {display}")
+
+        if custom:
+            lines.append("\n**Custom Roles (installed plugins):**")
+            for r in sorted(custom):
+                lines.append(f"  `{r}`")
+
+        lines.append("\nHire with: `hire <role>` or `hire <role> as \"Name\"`")
+        return "\n".join(lines)
+
+    def _hire(self, role_id: str, custom_name: str | None = None) -> str:
+        """Hire a new employee."""
         try:
-            crew_def = get_crew_def(crew_type, self.config)
+            role_def = get_role_def(role_id, self.config)
         except ValueError as e:
             return str(e)
 
-        project_context = self.project_info.to_prompt_context()
+        if not self.company.project_context:
+            self.company.project_context = self.project_info.to_prompt_context()
 
-        is_enterprise = crew_type == "enterprise"
+        try:
+            employee = self.company.hire(role_id, role_def, name=custom_name)
+        except ValueError as e:
+            return str(e)
 
-        if is_enterprise:
-            crew = EnterpriseCrew.create(
-                crew_type=crew_type,
-                crew_def=crew_def,
-                config=self.config,
-                objective=objective,
-                project_context=project_context,
-            )
+        display = ROLE_DISPLAY_NAMES.get(role_id, role_def.role)
+        return f"Hired **{employee.name}** as {display} (idle)"
+
+    def _fire(self, target: str) -> str:
+        """Fire an employee or team."""
+        resolved = self._resolve_name(target)
+        if not resolved:
+            return f"No employee or team named '{target}'."
+
+        if resolved in self.company.teams:
+            try:
+                fired = self.company.fire_team(resolved)
+                names = ", ".join(e.name for e in fired)
+                return f"Fired team **{resolved}** ({names})."
+            except ValueError as e:
+                return str(e)
         else:
-            crew = Crew.create(
-                crew_type=crew_type,
-                crew_def=crew_def,
-                config=self.config,
-                objective=objective,
-                project_context=project_context,
-            )
+            try:
+                emp = self.company.fire(resolved)
+                return f"Fired **{emp.name}** ({emp.role_def.role})."
+            except ValueError as e:
+                return str(e)
 
-        self.crews[crew.id] = crew
-        self.session.active_crew_id = crew.id
+    def _team_overview(self) -> str:
+        """Show company overview."""
+        n = len(self.company.employees)
+        nt = len(self.company.teams)
 
-        members = ", ".join(
-            f"{m.role}" for m in crew_def.members.values()
-        )
-
-        if is_enterprise:
+        if n == 0:
             return (
-                f"Hired **enterprise** crew: **{crew.id}**\n"
-                f"Objective: {objective}\n\n"
-                "**Enterprise mode** — the Project Lead will coordinate multiple sub-crews "
-                "(backend, frontend, devops, etc.) to deliver this project.\n\n"
-                "**Warning:** Enterprise mode may use 5-10x more tokens than a standard crew.\n\n"
-                "You're now talking to the Project Lead. Describe your project and they'll "
-                "propose a plan with sub-crews for your approval."
+                "No employees yet. Hire some!\n"
+                "Type `roles` to see available roles, or `hire <role>` to get started."
             )
 
-        return (
-            f"Hired **{crew_type}** crew: **{crew.id}**\n"
-            f"Objective: {objective}\n"
-            f"Team: {members}\n\n"
-            f"You're now talking to the {crew_type} crew lead. What would you like to start with?"
-        )
+        team_label = f", {nt} team(s)" if nt else ""
+        lines = [f"**Your Company** ({n} employees{team_label})\n"]
+        lines.append(self.company.status_summary)
 
-    def _fire_crew(self, crew_id: str) -> str:
-        """Fire/dismiss a crew."""
-        # Try exact match first, then partial
-        crew = self.crews.get(crew_id)
-        if not crew:
-            for cid, c in self.crews.items():
-                if crew_id in cid:
-                    crew = c
-                    crew_id = cid
-                    break
-
-        if not crew:
-            return f"No crew found matching '{crew_id}'."
-
-        crew.cleanup()
-        del self.crews[crew_id]
-
-        if self.session.active_crew_id == crew_id:
-            self.session.active_crew_id = next(iter(self.crews), None)
-
-        return f"Fired crew **{crew_id}**."
-
-    def _status(self) -> str:
-        """Show status of all crews."""
-        if not self.crews:
-            types = ", ".join(list_crew_types(self.config))
-            return (
-                "No active crews.\n\n"
-                f"Available crew types: {types}\n"
-                "Hire one with: `hire <type> <objective>`"
+        if not self.company.teams:
+            lines.append(
+                "\n  No teams configured. Employees work independently.\n"
+                "  Use `team create <name>` to organize them."
             )
 
-        lines = ["**Active Crews**\n"]
-        for crew in self.crews.values():
-            active = " (active)" if crew.id == self.session.active_crew_id else ""
-            lines.append(f"{crew.summary}{active}\n")
         return "\n".join(lines)
 
-    def _switch_crew(self, crew_id: str) -> str:
-        """Switch the active crew."""
-        # Try exact match, then partial
-        found = self.crews.get(crew_id)
-        if not found:
-            for cid, c in self.crews.items():
-                if crew_id in cid:
-                    found = c
-                    crew_id = cid
-                    break
+    def _team_create(self, name: str) -> str:
+        try:
+            self.company.create_team(name)
+            return f"Created team **{name}**."
+        except ValueError as e:
+            return str(e)
 
-        if not found:
-            return f"No crew found matching '{crew_id}'."
+    def _promote(self, emp_name: str, team_name: str) -> str:
+        resolved = self._resolve_name(emp_name)
+        if not resolved or resolved not in self.company.employees:
+            return f"No employee named '{emp_name}'."
+        try:
+            self.company.promote_to_lead(resolved, team_name)
+            return f"**{resolved}** is now Team Lead of **{team_name}**."
+        except ValueError as e:
+            return str(e)
 
-        self.session.active_crew_id = crew_id
-        return f"Now talking to **{crew_id}**."
+    def _assign_to_team_cmd(self, emp_name: str, team_name: str) -> str:
+        resolved_emp = self._resolve_name(emp_name)
+        if not resolved_emp or resolved_emp not in self.company.employees:
+            return f"No employee named '{emp_name}'."
+        resolved_team = self._resolve_name(team_name)
+        if not resolved_team or resolved_team not in self.company.teams:
+            return f"No team named '{team_name}'."
+        try:
+            self.company.assign_to_team(resolved_emp, resolved_team)
+            return f"**{resolved_emp}** added to team **{resolved_team}**."
+        except ValueError as e:
+            return str(e)
 
-    def _help(self) -> str:
-        types = ", ".join(list_crew_types(self.config))
-        return (
-            "**Shipwright Commands**\n\n"
-            f"  `hire <type> <objective>` — Hire a crew ({types})\n"
-            "  `hire enterprise <objective>` — Enterprise mode: Project Lead coordinates sub-crews\n"
-            "  `fire <crew-id>` — Dismiss a crew\n"
-            "  `status` — Show all active crews\n"
-            "  `talk to <crew-id>` — Switch active crew\n"
-            "  `log <crew-id>` — View conversation history\n"
-            "  `ship` — Open a PR for the active crew's work\n"
-            "  `shop` — Browse all available crews & specialists\n"
-            "  `installed` — List custom/installed crews\n"
-            "  `inspect <name>` — Show crew/specialist details\n"
-            "  `recruit <specialist> into <crew-id>` — Add specialist to a crew\n"
-            "  `sessions` — List all saved sessions\n"
-            "  `session save <name>` — Save current state as a named session\n"
-            "  `session load <name>` — Load a named session\n"
-            "  `session clear` — Clear current session state\n"
-            "  `help` — Show this help\n\n"
-            "Or just type naturally — messages go to the active crew lead."
-        )
+    def _talk(self, name: str) -> str:
+        resolved = self._resolve_name(name)
+        if not resolved or resolved not in self.company.employees:
+            return f"No employee named '{name}'."
+        self.company.set_active(resolved)
+        emp = self.company.employees[resolved]
+        return f"Now talking to **{resolved}** ({emp.display_role})."
 
-    def _crew_log(self, crew_id: str) -> str:
-        """Show conversation log for a crew."""
-        crew = self.crews.get(crew_id)
-        if not crew:
-            for cid, c in self.crews.items():
-                if crew_id in cid:
-                    crew = c
-                    break
+    def _status(self) -> str:
+        return self._team_overview()
 
-        if not crew:
-            return f"No crew found matching '{crew_id}'."
+    def _costs(self) -> str:
+        return self.company.cost_report
 
-        history = crew.lead.conversation_history
-        if not history:
-            return f"No conversation history for {crew.id}."
+    def _history(self, name: str) -> str:
+        resolved = self._resolve_name(name)
+        if not resolved or resolved not in self.company.employees:
+            return f"No employee named '{name}'."
+        emp = self.company.employees[resolved]
+        if not emp.task_history:
+            return f"No task history for {resolved}."
+        lines = [f"**Task History for {resolved}**\n"]
+        for task in emp.task_history[-10:]:
+            icon = {"done": "[x]", "failed": "[!]", "running": "[~]"}.get(
+                task.status, "[ ]",
+            )
+            cost = f" (${task.cost_usd:.4f})" if task.cost_usd > 0 else ""
+            lines.append(f"  {icon} {task.description[:60]}{cost}")
+        return "\n".join(lines)
 
-        lines = [f"**Conversation with {crew.id}**\n"]
-        for msg in history[-20:]:
-            role = "You" if msg["role"] == "user" else "Lead"
-            text = msg["text"][:300]
-            lines.append(f"**{role}:** {text}")
-        return "\n\n".join(lines)
-
-    async def _ship(self) -> str:
-        """Open a PR for the active crew."""
-        crew = self.active_crew
-        if not crew:
-            return "No active crew. Switch to a crew first."
-
-        if not crew.worktree_path:
-            return "This crew hasn't done any code changes yet."
-
-        pr_url = await crew.ship()
+    async def _ship(self, target: str | None = None) -> str:
+        if not self.company.employees:
+            return "No employees. Nothing to ship."
+        pr_url = await self.company.ship(target)
         if pr_url:
             return f"PR opened: {pr_url}"
-        return "Failed to open PR. Check the logs."
+        return "No code changes to ship, or PR creation failed."
+
+    def _help(self) -> str:
+        return (
+            "**Shipwright Commands**\n\n"
+            "  `roles` — List available roles to hire\n"
+            "  `hire <role>` — Hire an employee\n"
+            '  `hire <role> as "Name"` — Hire with a custom name\n'
+            "  `fire <name>` — Fire an employee\n"
+            "  `fire <team>` — Fire an entire team\n"
+            "  `team` — Show company overview\n"
+            "  `team create <name>` — Create a team\n"
+            "  `promote <name> to lead of <team>` — Make someone team lead\n"
+            "  `assign <name> to <team>` — Add employee to a team\n"
+            '  `assign <name> "<task>"` — Give work to an employee\n'
+            '  `assign <team> "<task>"` — Give work to a team (lead coordinates)\n'
+            "  `talk <name>` — Switch to talking to an employee\n"
+            "  `status` — Company overview\n"
+            "  `costs` — Budget/token usage per employee\n"
+            "  `history <name>` — Task history for an employee\n"
+            "  `ship` — Open PR for all work\n"
+            "  `ship <team>` — Open PR for team's work\n"
+            "  `save` — Save current state\n"
+            "  `sessions` — List saved sessions\n"
+            "  `session save <name>` — Save as named session\n"
+            "  `session load <name>` — Load a named session\n"
+            "  `session clear` — Reset everything\n"
+            "  `shop` — Browse all available roles & specialists\n"
+            "  `installed` — List custom/installed plugins\n"
+            "  `inspect <name>` — Show role/specialist details\n"
+            "  `help` — Show this help\n\n"
+            "Or just type naturally — messages go to the active employee."
+        )
 
     def _shop(self) -> str:
-        """List all available crews and specialists."""
-        lines = ["**Available Crews & Specialists**\n"]
+        lines = ["**Available Roles & Specialists**\n"]
+        lines.append("**Built-in Roles:**")
+        for role_id in sorted(BUILTIN_ROLES.keys()):
+            display = ROLE_DISPLAY_NAMES.get(role_id, role_id)
+            lines.append(f"  `{role_id}` — {display}")
 
-        lines.append("**Built-in Crews:**")
-        from shipwright.crew.registry import BUILTIN_CREWS
-        for name in sorted(BUILTIN_CREWS.keys()):
-            cdef = BUILTIN_CREWS[name]
-            members = ", ".join(m.role for m in cdef.members.values())
-            lines.append(f"  `{name}` — {members}")
-
-        # Custom crews
-        custom = [
-            (name, cdef) for name, cdef in self.config.custom_crews.items()
-            if name not in BUILTIN_CREWS
-        ]
-        if custom:
-            lines.append("\n**Custom Crews:**")
-            for name, cdef in sorted(custom):
-                desc = cdef.description or f"{len(cdef.members)} members"
-                lines.append(f"  `{name}` [{cdef.source}] — {desc}")
-
-        # Specialists
         specialists = list_specialists(self.config)
         if specialists:
             lines.append("\n**Specialists:**")
@@ -395,25 +494,19 @@ class Router:
                 desc = sdef.description or sdef.member_def.role
                 lines.append(f"  `{name}` [{sdef.source}] — {desc}")
 
-        lines.append(
-            "\nUse `inspect <name>` for details, "
-            "`hire <name> <objective>` to hire, "
-            "or `recruit <specialist> into <crew-id>` to add to a running crew."
-        )
+        lines.append("\nUse `inspect <name>` for details, `hire <name>` to hire.")
         return "\n".join(lines)
 
     def _installed(self) -> str:
-        """List custom/installed crews and specialists."""
         items = list_installed(self.config)
         if not items:
             return (
-                "No custom crews or specialists installed.\n\n"
+                "No custom roles or specialists installed.\n\n"
                 "Add them to `./shipwright/crews/` or `~/.shipwright/crews/`."
             )
-
-        lines = ["**Installed Crews & Specialists**\n"]
+        lines = ["**Installed Roles & Specialists**\n"]
         for item in items:
-            kind_tag = "crew" if item["kind"] == "crew" else "specialist"
+            kind_tag = item.get("kind", "role")
             desc = item["description"] or "(no description)"
             lines.append(
                 f"  `{item['name']}` ({kind_tag}) [{item['source']}] — {desc}"
@@ -421,46 +514,23 @@ class Router:
         return "\n".join(lines)
 
     def _inspect(self, name: str) -> str:
-        """Show detailed info about a crew or specialist."""
-        return inspect_crew(name, self.config)
+        return inspect_role(name, self.config)
 
-    def _recruit(self, specialist_name: str, crew_id: str) -> str:
-        """Recruit a specialist into an active crew."""
-        specialist = get_specialist_def(specialist_name, self.config)
-        if not specialist:
-            available = list_specialists(self.config)
-            if available:
-                return (
-                    f"Unknown specialist: '{specialist_name}'.\n"
-                    f"Available: {', '.join(available)}"
-                )
-            return (
-                f"Unknown specialist: '{specialist_name}'.\n"
-                "No specialists installed. Add them to "
-                "`./shipwright/crews/` or `~/.shipwright/crews/`."
-            )
-
-        # Find the crew (exact or partial match)
-        crew = self.crews.get(crew_id)
-        if not crew:
-            for cid, c in self.crews.items():
-                if crew_id in cid:
-                    crew = c
-                    crew_id = cid
-                    break
-
-        if not crew:
-            return f"No active crew found matching '{crew_id}'."
-
-        member_name = crew.recruit_specialist(specialist)
+    def _suggest_hire(self, text: str) -> str:
+        roles = list_roles(self.config)
         return (
-            f"Recruited **{specialist.member_def.role}** (`{member_name}`) "
-            f"into crew **{crew_id}**.\n"
-            f"The crew lead can now delegate work to `{member_name}`."
+            "No employees yet. Hire some!\n\n"
+            f"Available roles: {', '.join(roles[:8])}\n\n"
+            "Examples:\n"
+            "  `hire architect`\n"
+            "  `hire backend-dev`\n"
+            '  `hire frontend-dev as "Kai"`\n\n'
+            "Type `roles` for the full list or `help` for all commands."
         )
 
+    # ---- Session management ----
+
     def _list_sessions(self) -> str:
-        """List all saved sessions."""
         sessions = list_sessions(self.config)
         if not sessions:
             return "No saved sessions."
@@ -471,70 +541,42 @@ class Router:
         return "\n".join(lines)
 
     def _session_save(self, name: str) -> str:
-        """Save current state to a named session."""
         save_state(self.to_dict(), self.config, session_id=name)
         return f"Session saved as **{name}**."
 
     def _session_load(self, name: str) -> str:
-        """Load a named session, replacing current state."""
         data = load_state(self.config, session_id=name)
         if not data:
             return f"No session named '{name}' found."
 
-        # Replace session
-        self.session = Session.from_dict(
-            data.get("session", {"id": name})
-        )
-        self.crews.clear()
-
-        # Restore crews
-        stale_crews: list[str] = []
-        for cid, crew_data in data.get("crews", {}).items():
-            try:
-                crew_def = get_crew_def(crew_data["crew_type"], self.config)
-                if crew_data.get("is_enterprise"):
-                    crew = EnterpriseCrew.from_dict(crew_data, crew_def, self.config)
-                else:
-                    crew = Crew.from_dict(crew_data, crew_def, self.config)
-                self.crews[cid] = crew
-                if crew.is_stale:
-                    stale_crews.append(cid)
-            except (ValueError, KeyError) as e:
-                logger.warning("Failed to restore crew %s: %s", cid, e)
-
+        self.company = Company.from_dict(data.get("company", {}), self.config)
+        self.session = Session.from_dict(data.get("session", {"id": name}))
         self.session_name = name
-        n = len(self.crews)
-        msg = f"Loaded session **{name}** with {n} crew(s)."
-        if stale_crews:
-            msg += f"\n\nWarning: {len(stale_crews)} crew(s) have stale worktrees: {', '.join(stale_crews)}"
+
+        n = len(self.company.employees)
+        msg = f"Loaded session **{name}** with {n} employee(s)."
+        if self.company.is_stale:
+            msg += "\n\nWarning: company worktree no longer exists (marked stale)."
         return msg
 
     def _session_clear(self) -> str:
-        """Clear current session — dismiss all crews and reset history."""
-        self.crews.clear()
+        self.company = Company(config=self.config)
         self.session = Session(id=self.session.id)
-        return "Session cleared. All crews dismissed."
+        return "Session cleared. All employees dismissed."
 
-    def _suggest_hire(self, text: str) -> str:
-        """When no active crew, suggest hiring one."""
-        types = ", ".join(list_crew_types(self.config))
-        return (
-            "No active crew. Hire one first!\n\n"
-            f"Available types: {types}\n\n"
-            "Examples:\n"
-            "  `hire backend Add Stripe payments`\n"
-            "  `hire frontend Redesign the dashboard`\n"
-            "  `hire fullstack Build user authentication`\n\n"
-            "Or type `help` for all commands."
-        )
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
 
     def to_dict(self) -> dict:
-        """Serialize router state."""
-        return {
+        data: dict = {
             "session": self.session.to_dict(),
-            "crews": {cid: c.to_dict() for cid, c in self.crews.items()},
+            "company": self.company.to_dict(),
             "session_name": self.session_name,
         }
+        if self.config.budget_limit_usd > 0:
+            data["budget_limit_usd"] = self.config.budget_limit_usd
+        return data
 
     @classmethod
     def from_dict(cls, data: dict, config: Config) -> "Router":
@@ -543,15 +585,13 @@ class Router:
         session_name = data.get("session_name", "default")
         router = cls(config=config, session=session, session_name=session_name)
 
-        for cid, crew_data in data.get("crews", {}).items():
-            try:
-                crew_def = get_crew_def(crew_data["crew_type"], config)
-                if crew_data.get("is_enterprise"):
-                    crew = EnterpriseCrew.from_dict(crew_data, crew_def, config)
-                else:
-                    crew = Crew.from_dict(crew_data, crew_def, config)
-                router.crews[cid] = crew
-            except (ValueError, KeyError) as e:
-                logger.warning("Failed to restore crew %s: %s", cid, e)
+        # Restore company
+        company_data = data.get("company", {})
+        if company_data:
+            router.company = Company.from_dict(company_data, config)
+
+        # Backward compat: handle old crew-based state
+        elif "crews" in data:
+            logger.warning("Old crew-based state detected; ignoring.")
 
         return router

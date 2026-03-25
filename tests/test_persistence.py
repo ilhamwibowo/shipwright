@@ -17,7 +17,7 @@ class TestPersistence:
     def test_save_and_load(self, config: Config):
         data = {
             "session": {"id": "test", "messages": [{"role": "user", "text": "hi"}]},
-            "crews": {},
+            "company": {},
         }
         save_state(data, config, session_id="test")
 
@@ -58,5 +58,5 @@ class TestPersistence:
     def test_atomic_write(self, config: Config):
         """Verify no .tmp files are left behind."""
         save_state({"test": True}, config, session_id="test")
-        tmp_files = list(config.state_dir.glob("*.tmp"))
+        tmp_files = list(config.sessions_dir.glob("*.tmp"))
         assert len(tmp_files) == 0
