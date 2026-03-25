@@ -1,22 +1,27 @@
 [project]
 name = "shipwright"
 version = "2.0.0"
-description = "Virtual engineering crews powered by Claude — hire AI dev teams that collaborate conversationally"
+description = "Virtual engineering company powered by Claude — hire persistent AI employees, organize teams, and assign work conversationally"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.12"
 authors = [
     {name = "shipwright contributors"},
 ]
+keywords = ["ai", "claude", "engineering", "automation", "agents", "developer-tools"]
 classifiers = [
     "Development Status :: 4 - Beta",
+    "Environment :: Console",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Build Tools",
     "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Typing :: Typed",
 ]
 dependencies = [
     "claude-code-sdk>=0.0.20",
@@ -45,7 +50,10 @@ all = [
 shipwright = "shipwright.main:main"
 
 [project.urls]
+Homepage = "https://github.com/your-org/shipwright"
 Repository = "https://github.com/your-org/shipwright"
+Issues = "https://github.com/your-org/shipwright/issues"
+Documentation = "https://github.com/your-org/shipwright#readme"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

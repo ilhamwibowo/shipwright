@@ -12,7 +12,7 @@ from typing import Callable
 from shipwright.config import Config
 from shipwright.conversation.session import Session
 from shipwright.company.company import Company
-from shipwright.company.employee import Employee, EmployeeStatus
+from shipwright.company.employee import EmployeeStatus
 from shipwright.company.roles import (
     BUILTIN_ROLES,
     ROLE_DISPLAY_NAMES,
@@ -81,6 +81,11 @@ class Router:
         if not text:
             return ""
 
+        # Cap extremely long input to prevent resource issues
+        MAX_INPUT_LEN = 10_000
+        if len(text) > MAX_INPUT_LEN:
+            text = text[:MAX_INPUT_LEN]
+
         self.session.add_user_message(text)
 
         # Ensure project context is populated
@@ -117,11 +122,26 @@ class Router:
         if assign_match:
             target = assign_match.group(1)
             task_desc = assign_match.group(2).strip().strip('"')
+            if not task_desc:
+                response = "Task description cannot be empty. Usage: `assign <name> \"<task>\"`"
+                self.session.add_system_message(response)
+                return response
             resolved = self._resolve_name(target)
             if not resolved:
                 response = f"No employee or team named '{target}'."
                 self.session.add_system_message(response)
                 return response
+            # Check if employee is already working
+            if resolved in self.company.employees:
+                emp = self.company.employees[resolved]
+                if emp.status == EmployeeStatus.WORKING:
+                    response = (
+                        f"**{resolved}** is currently working"
+                        f"{': ' + emp.current_task.description[:40] if emp.current_task else ''}. "
+                        f"Wait for them to finish or talk to another employee."
+                    )
+                    self.session.add_system_message(response)
+                    return response
             try:
                 response = await self.company.assign_work(
                     resolved,
@@ -135,6 +155,16 @@ class Router:
                 return response
             except ValueError as e:
                 response = str(e)
+                self.session.add_system_message(response)
+                return response
+            except Exception as e:
+                logger.error("Unexpected error during work assignment: %s", e)
+                # Reset employee status on unexpected error
+                if resolved in self.company.employees:
+                    emp = self.company.employees[resolved]
+                    emp.status = EmployeeStatus.IDLE
+                    emp.current_task = None
+                response = f"Error assigning work to {resolved}: {e}"
                 self.session.add_system_message(response)
                 return response
 
@@ -163,16 +193,24 @@ class Router:
             self.session.add_system_message(response)
             return response
 
-        response = await self.company.talk(
-            employee.name,
-            text,
-            on_text=on_text,
-            on_delegation_start=on_delegation_start,
-            on_delegation_end=on_delegation_end,
-            on_progress=on_progress,
-        )
-        self.session.add_lead_message(response, crew_id=employee.name)
-        return response
+        try:
+            response = await self.company.talk(
+                employee.name,
+                text,
+                on_text=on_text,
+                on_delegation_start=on_delegation_start,
+                on_delegation_end=on_delegation_end,
+                on_progress=on_progress,
+            )
+            self.session.add_lead_message(response, crew_id=employee.name)
+            return response
+        except Exception as e:
+            logger.error("Error talking to %s: %s", employee.name, e)
+            employee.status = EmployeeStatus.IDLE
+            employee.current_task = None
+            response = f"Error communicating with {employee.name}: {e}"
+            self.session.add_system_message(response)
+            return response
 
     # ------------------------------------------------------------------
     # Sync command dispatcher
@@ -196,11 +234,14 @@ class Router:
             custom_name = hire_match.group(2) or hire_match.group(3)
             return True, self._hire(role_id, custom_name)
 
-        # fire <name>
+        # fire <name> [confirm]
         fire_match = re.match(r'^(?:fire|dismiss)\s+(.+)$', lower)
         if fire_match:
-            target = fire_match.group(1).strip()
-            return True, self._fire(target)
+            raw_target = fire_match.group(1).strip()
+            # Check for confirmation suffix
+            confirmed = raw_target.endswith(" confirm")
+            target = raw_target.removesuffix(" confirm").strip() if confirmed else raw_target
+            return True, self._fire(target, confirmed=confirmed)
 
         # team overview
         if lower in ("team", "teams", "company", "org"):
@@ -260,7 +301,10 @@ class Router:
             return True, self._session_load(text[len("session load "):].strip())
 
         if lower in ("session clear", "session reset"):
-            return True, self._session_clear()
+            return True, self._session_clear(confirmed=False)
+
+        if lower in ("session clear confirm", "session reset confirm"):
+            return True, self._session_clear(confirmed=True)
 
         # shop / installed / inspect
         if lower in ("shop", "browse", "marketplace", "available"):
@@ -323,10 +367,24 @@ class Router:
         try:
             role_def = get_role_def(role_id, self.config)
         except ValueError as e:
-            return str(e)
+            available = list_roles(self.config)
+            return (
+                f"{e}\n\n"
+                f"Available roles: {', '.join(available[:10])}\n"
+                f"Type `roles` for the full list."
+            )
 
         if not self.company.project_context:
             self.company.project_context = self.project_info.to_prompt_context()
+
+        # Validate custom name doesn't conflict with team names
+        if custom_name and custom_name.lower() in {
+            t.lower() for t in self.company.teams
+        }:
+            return (
+                f"Name '{custom_name}' conflicts with an existing team. "
+                f"Choose a different name."
+            )
 
         try:
             employee = self.company.hire(role_id, role_def, name=custom_name)
@@ -336,11 +394,28 @@ class Router:
         display = ROLE_DISPLAY_NAMES.get(role_id, role_def.role)
         return f"Hired **{employee.name}** as {display} (idle)"
 
-    def _fire(self, target: str) -> str:
-        """Fire an employee or team."""
+    def _fire(self, target: str, confirmed: bool = False) -> str:
+        """Fire an employee or team. Requires confirmation."""
         resolved = self._resolve_name(target)
         if not resolved:
             return f"No employee or team named '{target}'."
+
+        if not confirmed:
+            if resolved in self.company.teams:
+                team = self.company.teams[resolved]
+                members = ", ".join(team.members) if team.members else "no members"
+                return (
+                    f"Fire team **{resolved}** ({members})? "
+                    f"This will dismiss all team members.\n"
+                    f"Type: `fire {resolved} confirm`"
+                )
+            else:
+                emp = self.company.employees[resolved]
+                return (
+                    f"Fire **{resolved}** ({emp.role_def.role})? "
+                    f"This will dismiss them and lose their session context.\n"
+                    f"Type: `fire {resolved} confirm`"
+                )
 
         if resolved in self.company.teams:
             try:
@@ -380,6 +455,16 @@ class Router:
         return "\n".join(lines)
 
     def _team_create(self, name: str) -> str:
+        if not name:
+            return "Team name cannot be empty. Usage: `team create <name>`"
+        # Check for name conflicts with employees
+        if self._resolve_name(name) and name.lower() in {
+            n.lower() for n in self.company.employees
+        }:
+            return (
+                f"Name '{name}' conflicts with an existing employee. "
+                f"Choose a different team name."
+            )
         try:
             self.company.create_team(name)
             return f"Created team **{name}**."
@@ -430,22 +515,51 @@ class Router:
         emp = self.company.employees[resolved]
         if not emp.task_history:
             return f"No task history for {resolved}."
-        lines = [f"**Task History for {resolved}**\n"]
+
+        from datetime import datetime
+        from shipwright.company.company import format_duration_ms
+
+        lines = [f"**Task History for {resolved}** ({len(emp.task_history)} tasks)\n"]
         for task in emp.task_history[-10:]:
             icon = {"done": "[x]", "failed": "[!]", "running": "[~]"}.get(
                 task.status, "[ ]",
             )
-            cost = f" (${task.cost_usd:.4f})" if task.cost_usd > 0 else ""
-            lines.append(f"  {icon} {task.description[:60]}{cost}")
+            cost = f" ${task.cost_usd:.4f}" if task.cost_usd > 0 else ""
+            duration = f" {format_duration_ms(task.duration_ms)}" if task.duration_ms > 0 else ""
+            timestamp = ""
+            if task.created_at:
+                try:
+                    dt = datetime.fromtimestamp(task.created_at)
+                    timestamp = f" ({dt.strftime('%H:%M %b %d')})"
+                except (OSError, ValueError):
+                    pass
+            # Output preview (first line, truncated)
+            preview = ""
+            if task.output and task.status == "done":
+                first_line = task.output.strip().split("\n")[0][:80]
+                if first_line:
+                    preview = f"\n       {first_line}"
+            lines.append(
+                f"  {icon} {task.description[:60]}{cost}{duration}{timestamp}{preview}"
+            )
         return "\n".join(lines)
 
     async def _ship(self, target: str | None = None) -> str:
         if not self.company.employees:
             return "No employees. Nothing to ship."
-        pr_url = await self.company.ship(target)
-        if pr_url:
-            return f"PR opened: {pr_url}"
-        return "No code changes to ship, or PR creation failed."
+        if target:
+            resolved = self._resolve_name(target)
+            if not resolved or resolved not in self.company.teams:
+                return f"No team named '{target}'. Use `ship` to ship all work."
+            target = resolved
+        try:
+            pr_url = await self.company.ship(target)
+            if pr_url:
+                return f"PR opened: {pr_url}"
+            return "No code changes to ship, or PR creation failed."
+        except Exception as e:
+            logger.error("Error creating PR: %s", e)
+            return f"Failed to create PR: {e}"
 
     def _help(self) -> str:
         return (
@@ -541,17 +655,38 @@ class Router:
         return "\n".join(lines)
 
     def _session_save(self, name: str) -> str:
-        save_state(self.to_dict(), self.config, session_id=name)
-        return f"Session saved as **{name}**."
+        if not name:
+            return "Session name cannot be empty. Usage: `session save <name>`"
+        try:
+            save_state(self.to_dict(), self.config, session_id=name)
+            return f"Session saved as **{name}**."
+        except Exception as e:
+            logger.error("Failed to save session '%s': %s", name, e)
+            return f"Failed to save session: {e}"
 
     def _session_load(self, name: str) -> str:
+        if not name:
+            return "Session name cannot be empty. Usage: `session load <name>`"
         data = load_state(self.config, session_id=name)
         if not data:
-            return f"No session named '{name}' found."
+            sessions = list_sessions(self.config)
+            if sessions:
+                return (
+                    f"No session named '{name}' found.\n"
+                    f"Available sessions: {', '.join(sorted(sessions))}"
+                )
+            return f"No session named '{name}' found. No saved sessions exist."
 
-        self.company = Company.from_dict(data.get("company", {}), self.config)
-        self.session = Session.from_dict(data.get("session", {"id": name}))
-        self.session_name = name
+        try:
+            self.company = Company.from_dict(data.get("company", {}), self.config)
+            self.session = Session.from_dict(data.get("session", {"id": name}))
+            self.session_name = name
+        except Exception as e:
+            logger.error("Failed to restore session '%s': %s", name, e)
+            return (
+                f"Session '{name}' is corrupted and could not be loaded: {e}\n"
+                f"You may want to clear it with `session clear confirm`."
+            )
 
         n = len(self.company.employees)
         msg = f"Loaded session **{name}** with {n} employee(s)."
@@ -559,7 +694,19 @@ class Router:
             msg += "\n\nWarning: company worktree no longer exists (marked stale)."
         return msg
 
-    def _session_clear(self) -> str:
+    def _session_clear(self, confirmed: bool = False) -> str:
+        if not confirmed:
+            n = len(self.company.employees)
+            if n == 0:
+                # Nothing to lose — just clear
+                self.company = Company(config=self.config)
+                self.session = Session(id=self.session.id)
+                return "Session cleared."
+            return (
+                f"Clear session? This will dismiss all {n} employee(s) "
+                f"and lose their session context.\n"
+                f"Type: `session clear confirm`"
+            )
         self.company = Company(config=self.config)
         self.session = Session(id=self.session.id)
         return "Session cleared. All employees dismissed."

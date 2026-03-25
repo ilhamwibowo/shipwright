@@ -34,15 +34,25 @@ def save_state(data: dict, config: Config, session_id: str = "default") -> None:
 
 
 def load_state(config: Config, session_id: str = "default") -> dict | None:
-    """Load router state from disk. Returns None if not found."""
+    """Load router state from disk. Returns None if not found or corrupted."""
     path = _state_path(config, session_id)
     if not path.exists():
         return None
 
     try:
-        data = json.loads(path.read_text())
+        raw = path.read_text()
+        if not raw.strip():
+            logger.warning("Empty state file: %s", path)
+            return None
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            logger.warning("State file is not a JSON object: %s", path)
+            return None
         logger.debug("State loaded: %s", path)
         return data
+    except json.JSONDecodeError as e:
+        logger.warning("Corrupted JSON in state file %s: %s", path, e)
+        return None
     except Exception:
         logger.warning("Failed to load state from %s", path, exc_info=True)
         return None

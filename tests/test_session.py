@@ -256,7 +256,16 @@ class TestSessionCommands:
         router._try_sync_command("hire frontend-dev", "hire frontend-dev")
         assert len(router.company.employees) == 2
 
+        # First call asks for confirmation
         is_cmd, response = router._try_sync_command("session clear", "session clear")
+        assert is_cmd
+        assert "confirm" in response.lower()
+        assert len(router.company.employees) == 2
+
+        # Second call with confirm actually clears
+        is_cmd, response = router._try_sync_command(
+            "session clear confirm", "session clear confirm"
+        )
         assert is_cmd
         assert "cleared" in response.lower()
         assert len(router.company.employees) == 0
@@ -265,6 +274,7 @@ class TestSessionCommands:
         router = self._make_router(config)
         original_id = router.session.id
 
+        # Empty company clears immediately
         router._try_sync_command("session clear", "session clear")
         assert router.session.id == original_id
 

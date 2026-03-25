@@ -137,7 +137,16 @@ class TestRouter:
         router._try_sync_command("hire backend-dev", "hire backend-dev")
         emp_name = list(router.company.employees.keys())[0]
 
+        # First call asks for confirmation
         is_cmd, response = router._try_sync_command(f"fire {emp_name}", f"fire {emp_name.lower()}")
+        assert is_cmd
+        assert "confirm" in response.lower()
+        assert len(router.company.employees) == 1
+
+        # Second call with confirm actually fires
+        is_cmd, response = router._try_sync_command(
+            f"fire {emp_name} confirm", f"fire {emp_name.lower()} confirm"
+        )
         assert is_cmd
         assert "Fired" in response
         assert len(router.company.employees) == 0

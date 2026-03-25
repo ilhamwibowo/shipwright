@@ -43,6 +43,22 @@ def _extract_session_flag(args: list[str]) -> tuple[str, list[str]]:
     return session_name, remaining
 
 
+def _check_claude_cli() -> None:
+    """Check that the claude CLI is installed and accessible."""
+    import shutil
+
+    if not shutil.which("claude"):
+        print(
+            "Error: 'claude' CLI not found.\n\n"
+            "Shipwright requires the Claude Code CLI to run.\n"
+            "Install it with:\n\n"
+            "  npm install -g @anthropic-ai/claude-code\n\n"
+            "Then ensure 'claude' is on your PATH and try again.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def main() -> None:
     # Suppress INFO logs in interactive CLI — only show warnings/errors
     import logging
@@ -55,6 +71,19 @@ def main() -> None:
 
     # Extract --session flag before processing other args
     session_name, args = _extract_session_flag(args)
+
+    # Help doesn't need claude CLI
+    if args and args[0] in ("--help", "-h"):
+        _print_help()
+        return
+
+    if args and args[0] == "sessions":
+        config = load_config()
+        _list_sessions(config)
+        return
+
+    # Everything else needs the claude CLI
+    _check_claude_cli()
 
     if not args:
         # Interactive REPL mode
@@ -81,15 +110,6 @@ def main() -> None:
         from shipwright.interfaces.discord import DiscordBot
         bot = DiscordBot(config)
         bot.run()
-        return
-
-    if args[0] == "--help" or args[0] == "-h":
-        _print_help()
-        return
-
-    if args[0] == "sessions":
-        config = load_config()
-        _list_sessions(config)
         return
 
     if args[0] in ("team", "status"):
