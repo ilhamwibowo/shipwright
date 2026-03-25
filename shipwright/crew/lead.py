@@ -12,7 +12,7 @@ describes its crew members and how to coordinate them.
 
 from __future__ import annotations
 
-import json
+import re
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -54,24 +54,83 @@ AI developers to accomplish tasks.
 ## How You Work
 1. When you receive a task, analyze what needs to be done
 2. Break it into steps and delegate to the right team members
-3. When you need a member to work, describe exactly what they should do
-4. Report progress and results to the user
-5. Ask clarifying questions when the task is ambiguous
+3. Tell the user what you're about to do (e.g. "I'm having the architect look at the codebase...")
+4. Use the delegation format below to assign work to members
+5. Review member results and either delegate more work or respond to the user
+
+## Delegation Format
+When you need a team member to do work, include one or more delegation blocks in your response:
+
+[DELEGATE:member_name]
+Detailed task description for the member.
+Include all context they need to do the work.
+[/DELEGATE]
+
+For example:
+[DELEGATE:architect]
+Explore the codebase and identify all payment-related code.
+Look for existing Stripe integrations or payment models.
+Write a brief spec of what exists and what needs to change.
+[/DELEGATE]
+
+You can delegate to multiple members at once — they will work in parallel:
+[DELEGATE:frontend]
+Build the checkout form component.
+[/DELEGATE]
+[DELEGATE:backend]
+Implement the /api/checkout endpoint.
+[/DELEGATE]
+
+You can also delegate in stages: first delegate to the architect for analysis, review the results, \
+then delegate to implementers with the spec. The system will feed member results back to you \
+so you can plan the next step.
 
 ## Communication Style
 - Be conversational and collaborative
-- Explain your plan before executing
+- ALWAYS tell the user what you're delegating and why before the [DELEGATE] block
 - Report progress at milestones
-- Present results clearly with summaries
+- After receiving member results, summarize what was done
 - Ask for feedback before moving to the next phase
 
 ## Important Rules
-- You coordinate — you don't write code yourself
+- You coordinate — you don't write code yourself. Use [DELEGATE] blocks to assign work.
 - Each member has specific tools; respect their capabilities
 - Work happens in isolated git worktrees for safety
 - If something fails, diagnose and retry or escalate to the user
+- Member names must exactly match: {', '.join(crew_def.members.keys()) if crew_def.members else 'none'}
 
 {f"## Project Context{chr(10)}{project_context}" if project_context else ""}"""
+
+
+_DELEGATE_PATTERN = re.compile(
+    r"\[DELEGATE:(\w+)\]\s*\n(.*?)\[/DELEGATE\]",
+    re.DOTALL,
+)
+
+
+@dataclass
+class DelegationRequest:
+    """A parsed delegation request from the lead's response."""
+
+    member_name: str
+    task: str
+
+
+def parse_delegations(text: str) -> tuple[str, list[DelegationRequest]]:
+    """Parse [DELEGATE:member] blocks from the lead's response.
+
+    Returns:
+        Tuple of (clean_text with blocks removed, list of DelegationRequests).
+    """
+    delegations: list[DelegationRequest] = []
+    for match in _DELEGATE_PATTERN.finditer(text):
+        member_name = match.group(1).strip()
+        task = match.group(2).strip()
+        if member_name and task:
+            delegations.append(DelegationRequest(member_name=member_name, task=task))
+
+    clean_text = _DELEGATE_PATTERN.sub("", text).strip()
+    return clean_text, delegations
 
 
 @dataclass
@@ -79,7 +138,7 @@ class LeadResponse:
     """Parsed response from the crew lead."""
 
     text: str
-    member_tasks: list[dict] = field(default_factory=list)
+    delegations: list[DelegationRequest] = field(default_factory=list)
     session_id: str = ""
 
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Callable
 
 from shipwright.config import Config, CrewDef
-from shipwright.crew.lead import CrewLead
+from shipwright.crew.lead import CrewLead, DelegationRequest, parse_delegations
 from shipwright.crew.member import CrewMember, MemberResult
 from shipwright.utils.logging import get_logger
 from shipwright.workspace.git import (
@@ -147,6 +147,8 @@ class Crew:
             self.worktree_path = None
             logger.info("Crew %s cleaned up", self.id)
 
+    max_delegation_rounds: int = 5
+
     async def chat(
         self,
         user_message: str,
@@ -154,22 +156,124 @@ class Crew:
     ) -> str:
         """Send a message to the crew lead and get a response.
 
-        This is the primary interaction point. The lead will:
-        1. Analyze the message
-        2. Respond conversationally
-        3. Potentially delegate work to members
+        Implements a delegation loop:
+        1. Lead responds (may include [DELEGATE] blocks)
+        2. Parse delegation requests and execute them
+        3. Feed results back to the lead
+        4. Repeat until the lead responds without delegations or max rounds hit
 
-        Returns the lead's response text.
+        Returns the lead's final response text.
         """
+        self._ensure_members()
         status_ctx = self._build_status_context()
+        collected_responses: list[str] = []
 
+        # Initial lead response
         response = await self.lead.respond(
             user_message=user_message,
             status_context=status_ctx,
             on_text=on_text,
         )
 
-        return response.text
+        clean_text, delegations = parse_delegations(response.text)
+        if clean_text:
+            collected_responses.append(clean_text)
+
+        round_num = 0
+        while delegations and round_num < self.max_delegation_rounds:
+            round_num += 1
+            logger.info(
+                "[%s] Delegation round %d: %d task(s)",
+                self.id, round_num, len(delegations),
+            )
+
+            # Build context from prior delegation results for members
+            delegation_context = self._build_delegation_context()
+
+            # Execute delegations (parallel if multiple, sequential if single)
+            if len(delegations) == 1:
+                d = delegations[0]
+                result = await self._execute_delegation(d, delegation_context, on_text)
+                results_summary = self._format_member_result(d.member_name, result)
+            else:
+                tasks = [
+                    (d.member_name, d.task, delegation_context)
+                    for d in delegations
+                ]
+                parallel_results = await self.delegate_parallel(tasks)
+                parts = []
+                for d in delegations:
+                    r = parallel_results.get(d.member_name)
+                    if r:
+                        parts.append(self._format_member_result(d.member_name, r))
+                results_summary = "\n\n".join(parts)
+
+            # Feed results back to the lead
+            followup = (
+                f"Here are the results from the team:\n\n{results_summary}\n\n"
+                "Review the results. If more work is needed, delegate again. "
+                "Otherwise, summarize the outcome for the user."
+            )
+
+            response = await self.lead.respond(
+                user_message=followup,
+                status_context=self._build_status_context(),
+                on_text=on_text,
+            )
+
+            clean_text, delegations = parse_delegations(response.text)
+            if clean_text:
+                collected_responses.append(clean_text)
+
+        if delegations:
+            logger.warning(
+                "[%s] Hit max delegation rounds (%d), returning partial result",
+                self.id, self.max_delegation_rounds,
+            )
+            collected_responses.append(
+                "(Reached maximum delegation rounds. Some work may still be pending.)"
+            )
+
+        return "\n\n".join(collected_responses)
+
+    async def _execute_delegation(
+        self,
+        delegation: DelegationRequest,
+        context: str,
+        on_text: Callable[[str], None] | None = None,
+    ) -> MemberResult:
+        """Execute a single delegation request."""
+        return await self.delegate(
+            member_name=delegation.member_name,
+            task=delegation.task,
+            context=context,
+            on_text=on_text,
+        )
+
+    def _build_delegation_context(self) -> str:
+        """Build context from prior delegation results for member tasks."""
+        if not self.task_records:
+            return ""
+
+        parts = ["## Prior work by the crew:"]
+        for r in self.task_records[-10:]:
+            if r.status == "done" and r.output:
+                parts.append(f"### {r.member_name}: {r.task[:80]}")
+                # Truncate to keep context manageable
+                output = r.output[:3000]
+                if len(r.output) > 3000:
+                    output += "\n... (truncated)"
+                parts.append(output)
+        return "\n\n".join(parts) if len(parts) > 1 else ""
+
+    @staticmethod
+    def _format_member_result(member_name: str, result: MemberResult) -> str:
+        """Format a member result for the lead to review."""
+        status = "FAILED" if result.is_error else "COMPLETED"
+        output = result.output[:5000]
+        if len(result.output) > 5000:
+            output += "\n... (truncated)"
+        return f"### [{status}] {member_name}\n{output}"
 
     async def delegate(
         self,
