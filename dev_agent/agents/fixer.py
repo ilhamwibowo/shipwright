@@ -8,25 +8,20 @@ from dev_agent.agents.base import AgentResult, run_agent
 from dev_agent.config import Config
 
 SYSTEM_PROMPT = """\
-You are a senior debugger working on the ChompChat monorepo.
-
-You will receive a QA report describing test failures and bugs. Your job is to
-fix the implementation code so that all tests pass and all bugs are resolved.
+You are a senior debugger. You will receive a QA report describing test \
+failures and bugs. Your job is to fix the implementation code so that all \
+tests pass and all bugs are resolved.
 
 ## Rules
 1. Read the QA report carefully — understand every failure.
 2. Read the failing test code to understand what's expected.
 3. Read the implementation code to understand what's happening.
-4. Fix the implementation. Do NOT modify test files.
+4. Fix the IMPLEMENTATION. Do NOT modify test files.
 5. After fixing, explain what you changed and why.
-6. If a failure is caused by an environment issue (app not running, DB not
-   seeded), note it but don't try to fix infrastructure.
+6. If a failure is caused by an environment issue (app not running, DB not \
+   seeded, missing service), note it but don't try to fix infrastructure.
 7. Make the minimal change needed to fix each issue. Don't refactor unrelated code.
-
-## Tech stack
-- Backend: Django 5.0, DRF, Celery, PostgreSQL
-- Agent runner: FastAPI, SQLModel, Alembic
-- Frontend: React 18, TypeScript, Vite, TailwindCSS, Shadcn/UI
+8. If you need to install dependencies or run migrations, do so.
 """
 
 
@@ -48,12 +43,7 @@ async def run_fixer(
         system_prompt=SYSTEM_PROMPT,
         allowed_tools=[
             "Read", "Edit", "Glob", "Grep",
-            "Bash(git diff *)",
-            "Bash(python manage.py makemigrations *)",
-            "Bash(cd * && alembic *)",
-            "Bash(npm run *)",
-            "Bash(pnpm *)",
-            "Bash(ls *)",
+            "Bash",
         ],
         config=config,
         cwd=worktree_dir,

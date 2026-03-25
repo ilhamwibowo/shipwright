@@ -1,34 +1,19 @@
-"""Team Lead agent -- a hierarchical coordinator that manages sub-agents.
+"""Team Lead agent — a hierarchical coordinator that manages sub-agents.
 
-A team lead is itself an agent that can decompose a complex task into subtasks
-and dispatch them to specialized agents (architect, implementer, test_writer,
-qa, fixer, reviewer). This enables hierarchical delegation: the top-level
-coordinator can assign a large feature to a team_lead, which then manages
-its own pipeline internally.
-
-Unlike the top-level coordinator (which is stateless per-message), a team_lead
-maintains context across its subtask pipeline and can make adaptive decisions
-(e.g., skip review if changes are trivial, add extra QA rounds if quality is low).
+Uses direct Anthropic API calls. Decomposes complex tasks into subtasks
+and dispatches them to specialized agents with adaptive decision-making.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
 
-from claude_agent_sdk import (
-    AssistantMessage,
-    ClaudeAgentOptions,
-    TextBlock,
-    query,
-)
-from dev_agent.agents.base import AgentResult, run_agent
+from dev_agent.agents.base import AgentResult, TokenUsage, query_llm
 from dev_agent.config import Config
 
 logger = logging.getLogger(__name__)
-
 
 SYSTEM_PROMPT = """\
 You are a technical team lead managing a sub-team of AI agents. You receive a \
@@ -36,10 +21,10 @@ high-level objective and must break it into an ordered plan of agent steps, \
 then execute them one at a time, reviewing each result before proceeding.
 
 Your available agents:
-- architect: reads codebase, writes a technical spec (READ-ONLY, never modifies source)
+- architect: reads codebase, discovers tech stack, writes a technical spec (READ-ONLY)
 - implementer: writes code from a spec
-- test_writer: writes E2E tests from a requirement (isolated from implementation)
-- qa: runs tests + Playwright browser testing
+- test_writer: writes tests from a requirement (isolated from implementation)
+- qa: runs tests + manual exploration
 - fixer: fixes code based on QA failures (never touches tests)
 - reviewer: final quality gate
 
@@ -68,7 +53,7 @@ Phase 3 (final summary):
 class SubTask:
     agent: str
     task: str
-    status: str = "pending"  # pending, running, done, failed, skipped
+    status: str = "pending"
     result: str = ""
 
 
@@ -78,7 +63,6 @@ class TeamLeadState:
     plan: list[SubTask] = field(default_factory=list)
     current_step: int = 0
     context: dict = field(default_factory=dict)
-    conversation: list[dict] = field(default_factory=list)
 
 
 def _extract_json(text: str) -> str:
@@ -96,35 +80,32 @@ def _extract_json(text: str) -> str:
     return text.strip()
 
 
-async def _query_team_lead(prompt: str, config: Config) -> dict:
+async def _query_team_lead(prompt: str, config: Config) -> tuple[dict, TokenUsage]:
     """Query the team lead LLM for a decision."""
-    collected: list[str] = []
-    async for msg in query(
+    text, usage = await query_llm(
         prompt=prompt,
-        options=ClaudeAgentOptions(
-            allowed_tools=[],
-            permission_mode="bypassPermissions",
-            max_turns=1,
-            model=config.agent_model,
-            system_prompt=SYSTEM_PROMPT,
-        ),
-    ):
-        if isinstance(msg, AssistantMessage):
-            for block in msg.content:
-                if isinstance(block, TextBlock):
-                    collected.append(block.text)
+        system_prompt=SYSTEM_PROMPT,
+        config=config,
+        max_tokens=4096,
+    )
 
-    text = "".join(collected).strip()
     cleaned = _extract_json(text)
     try:
-        return json.loads(cleaned)
+        return json.loads(cleaned), usage
     except json.JSONDecodeError:
         logger.warning("Team lead JSON parse failed: %s", cleaned[:200])
-        return {"phase": "complete", "summary": text[:500], "quality": "low", "issues": ["JSON parse error"]}
+        return {
+            "phase": "complete",
+            "summary": text[:500],
+            "quality": "low",
+            "issues": ["JSON parse error"],
+        }, usage
 
 
-async def _run_sub_agent(agent: str, task: str, ctx: dict, config: Config) -> str:
-    """Run a sub-agent and return its output."""
+async def _run_sub_agent(
+    agent: str, task: str, ctx: dict, config: Config
+) -> tuple[str, TokenUsage]:
+    """Run a sub-agent and return (output, usage)."""
     from dev_agent.agents.architect import run_architect
     from dev_agent.agents.fixer import run_fixer
     from dev_agent.agents.implementer import run_implementer
@@ -173,7 +154,7 @@ async def _run_sub_agent(agent: str, task: str, ctx: dict, config: Config) -> st
         raise ValueError(f"Unknown sub-agent: {agent}")
 
     result = await runners[agent]()
-    return result.output
+    return result.output, result.usage
 
 
 async def run_team_lead(
@@ -183,22 +164,13 @@ async def run_team_lead(
     workspace_dir: str | None = None,
     on_progress: callable | None = None,
 ) -> AgentResult:
-    """Run a team lead that adaptively manages a sub-agent pipeline.
-
-    Unlike the flat pipeline in the coordinator, the team lead:
-    1. Plans its own steps based on the objective
-    2. Reviews each step's output before proceeding
-    3. Can dynamically add fix steps, skip steps, or stop early
-    4. Produces a quality-assessed summary at the end
-
-    This function should be called from within asyncio.to_thread /
-    asyncio.run, just like other agents.
-    """
+    """Run a team lead that adaptively manages a sub-agent pipeline."""
     state = TeamLeadState(objective=objective)
     state.context["requirement"] = objective
     if worktree_dir:
         state.context["worktree"] = worktree_dir
     ws = workspace_dir or str(config.workspace_dir)
+    total_usage = TokenUsage()
 
     def progress(msg: str) -> None:
         if on_progress:
@@ -207,14 +179,18 @@ async def run_team_lead(
 
     # Phase 1: Plan
     progress(f"Planning: {objective[:80]}")
-    plan_response = await _query_team_lead(
+    plan_response, usage = await _query_team_lead(
         f"Objective: {objective}\n\nCreate a plan.", config
     )
+    total_usage.input_tokens += usage.input_tokens
+    total_usage.output_tokens += usage.output_tokens
+    total_usage.api_calls += usage.api_calls
 
     if plan_response.get("phase") != "plan" or not plan_response.get("plan"):
         return AgentResult(
             success=False,
             output=plan_response.get("summary", "Team lead failed to create a plan."),
+            usage=total_usage,
         )
 
     for step_def in plan_response["plan"]:
@@ -234,14 +210,17 @@ async def run_team_lead(
         progress(f"Step {step_num}/{total}: {subtask.agent} -- {subtask.task[:60]}")
 
         try:
-            result = await _run_sub_agent(
+            result, sub_usage = await _run_sub_agent(
                 subtask.agent, subtask.task, state.context, config
             )
+            total_usage.input_tokens += sub_usage.input_tokens
+            total_usage.output_tokens += sub_usage.output_tokens
+            total_usage.api_calls += sub_usage.api_calls
+
             subtask.status = "done"
             subtask.result = result
             outputs.append(f"[{subtask.agent}] {result}")
 
-            # Update context
             if subtask.agent == "architect":
                 from pathlib import Path
                 sp = Path(ws) / "spec.md"
@@ -256,11 +235,13 @@ async def run_team_lead(
             result = f"FAILED: {exc}"
             outputs.append(f"[{subtask.agent}] {result}")
 
-        # Ask team lead what to do next (unless this was the last step)
         if state.current_step < len(state.plan) - 1:
             remaining = [
                 f"  {i+1}. {s.agent}: {s.task[:50]}"
-                for i, s in enumerate(state.plan[state.current_step + 1:], start=state.current_step + 1)
+                for i, s in enumerate(
+                    state.plan[state.current_step + 1 :],
+                    start=state.current_step + 1,
+                )
             ]
             decision_prompt = (
                 f"Objective: {objective}\n\n"
@@ -270,7 +251,11 @@ async def run_team_lead(
                 f"Remaining steps:\n" + "\n".join(remaining) + "\n\n"
                 f"What should we do next?"
             )
-            decision = await _query_team_lead(decision_prompt, config)
+            decision, d_usage = await _query_team_lead(decision_prompt, config)
+            total_usage.input_tokens += d_usage.input_tokens
+            total_usage.output_tokens += d_usage.output_tokens
+            total_usage.api_calls += d_usage.api_calls
+
             action = decision.get("action", "continue")
             feedback = decision.get("feedback", "")
 
@@ -279,7 +264,7 @@ async def run_team_lead(
 
             if action == "done":
                 progress("Team lead decided to stop early.")
-                for s in state.plan[state.current_step + 1:]:
+                for s in state.plan[state.current_step + 1 :]:
                     s.status = "skipped"
                 break
             elif action == "skip":
@@ -295,9 +280,12 @@ async def run_team_lead(
                 )
                 state.plan.insert(state.current_step + 1, fix_task)
 
-            # Allow the team lead to override the next step's task
             override = decision.get("adjust_next_task")
-            if override and action == "continue" and state.current_step + 1 < len(state.plan):
+            if (
+                override
+                and action == "continue"
+                and state.current_step + 1 < len(state.plan)
+            ):
                 state.plan[state.current_step + 1].task = override
 
         state.current_step += 1
@@ -311,7 +299,10 @@ async def run_team_lead(
         f"All steps completed:\n{step_results}\n\n"
         f"Provide your final summary."
     )
-    final = await _query_team_lead(final_prompt, config)
+    final, f_usage = await _query_team_lead(final_prompt, config)
+    total_usage.input_tokens += f_usage.input_tokens
+    total_usage.output_tokens += f_usage.output_tokens
+    total_usage.api_calls += f_usage.api_calls
 
     summary = final.get("summary", "Team lead pipeline complete.")
     quality = final.get("quality", "unknown")
@@ -326,4 +317,5 @@ async def run_team_lead(
     return AgentResult(
         success=quality in ("high", "medium"),
         output=result_text,
+        usage=total_usage,
     )

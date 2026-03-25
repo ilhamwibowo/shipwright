@@ -9,15 +9,9 @@ from dev_agent.agents.base import AgentResult, run_agent
 from dev_agent.config import Config
 
 SYSTEM_PROMPT = """\
-You are a senior code reviewer for the ChompChat project.
-
-You will receive:
-1. The original requirement
-2. The technical spec
-3. The QA report
-4. Access to the code diff
-
-Your job is a final quality gate before this goes into a PR.
+You are a senior code reviewer. You will receive the original requirement, \
+the technical spec, and the QA report. Your job is a final quality gate \
+before this goes into a PR.
 
 ## Review checklist
 1. **Requirement coverage** — Does the implementation satisfy the original ask?
@@ -27,7 +21,7 @@ Your job is a final quality gate before this goes into a PR.
 5. **Migrations** — If DB changes were made, are migrations present and correct?
 6. **Edge cases** — Were the spec's edge cases handled?
 7. **Dead code** — No commented-out code, unused imports, debug prints left behind
-8. **Test coverage** — Do the E2E tests cover the acceptance criteria?
+8. **Test coverage** — Do the tests cover the acceptance criteria?
 
 ## Your output
 Write a review report with:
@@ -65,10 +59,8 @@ async def run_reviewer(
         system_prompt=SYSTEM_PROMPT,
         allowed_tools=[
             "Read", "Glob", "Grep",
-            "Bash(git diff *)",
-            "Bash(git log *)",
-            "Bash(git show *)",
-            "Bash(ls *)",
+            "Bash(git diff *)", "Bash(git log *)",
+            "Bash(git show *)", "Bash(ls *)",
         ],
         config=config,
         cwd=worktree_dir,

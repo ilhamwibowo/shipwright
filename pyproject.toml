@@ -1,19 +1,57 @@
 [project]
 name = "dev-agent"
-version = "0.1.0"
-description = "Multi-agent development pipeline for ChompChat"
+version = "1.0.0"
+description = "Multi-agent development pipeline — autonomous planning, implementation, testing, and PR creation"
+readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.12"
+authors = [
+    {name = "dev-agent contributors"},
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Testing",
+]
 dependencies = [
-    "claude-agent-sdk>=0.1.48",
+    "anthropic>=0.40.0",
     "httpx>=0.27.0",
     "python-dotenv>=1.0.0",
 ]
 
 [project.optional-dependencies]
+telegram = []  # Uses httpx (already in core deps)
+discord = [
+    "discord.py>=2.3.0",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "ruff>=0.4.0",
+]
+all = [
+    "dev-agent[discord,dev]",
 ]
 
 [project.scripts]
 dev-agent = "dev_agent.main:main"
+
+[project.urls]
+Repository = "https://github.com/your-org/dev-agent"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

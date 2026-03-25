@@ -1,2 +1,0 @@
-[console_scripts]
-dev-agent = dev_agent.main:main
