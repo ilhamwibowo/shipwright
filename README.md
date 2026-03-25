@@ -1,24 +1,29 @@
-# 🚢 Shipwright
+# Shipwright
 
-**Virtual engineering crews powered by Claude. Hire AI dev teams that collaborate conversationally — not fire-and-forget.**
+**Build an AI engineering company powered by Claude. Hire persistent employees, organize them into teams, and assign work conversationally.**
 
-Shipwright lets you hire domain-specific AI engineering crews (backend, frontend, QA, devops, etc.) and talk to them like real teams. Each crew has a lead who asks clarifying questions, proposes approaches, delegates work to specialized members, and reports back. It's collaborative software development with AI — not a black box that spits out a PR.
+Shipwright lets you hire AI engineers by role — backend developers, architects, QA engineers — and manage them like a real company. Employees persist across tasks, accumulate context, and remember what they've worked on. Organize them into teams with leads who coordinate and delegate. It's collaborative AI development with memory and structure.
 
 ```
-You:  hire backend Add Stripe payments
-Lead: What payment provider specifics? One-time charges, subscriptions, or both?
-      I'll have the Architect explore your codebase for existing payment patterns.
-You:  Stripe. Design for subs but implement one-time first.
-Lead: Smart. Architect is done — here's the proposed approach:
-      • POST /api/checkout — create PaymentIntent
-      • Webhook handler for payment confirmation
-      • payments table with status tracking
-      Want me to proceed?
-You:  Ship it.
-Lead: Backend Dev is on the API, DB Engineer on migrations.
-      I'll check in when they're done.
-      ...
-Lead: All done. Tests passing. Ready to open a PR?
+shipwright > hire architect
+  Hired Nori as Architect (idle)
+
+shipwright > hire backend-dev
+  Hired Quinn as Backend Developer (idle)
+
+shipwright > assign Nori "Explore the codebase and map the architecture"
+  Nori is working...
+  Nori done (34.2s)
+
+shipwright > talk Nori
+  [Nori/Architect] > What did you find?
+
+  Nori: The codebase has two main services: a Django REST backend and a
+        FastAPI agent runner. Backend handles restaurants, orders, and
+        telephony. Agent runner manages AI voice/SMS agents...
+
+shipwright > assign Quinn "Add Stripe payment processing — use Nori's notes"
+  Quinn is working...
 ```
 
 ---
@@ -41,187 +46,228 @@ pip install shipwright[discord]    # Discord bot
 pip install shipwright[all]        # Everything
 ```
 
-### Basic Usage
+### Your First Hire
 
 ```bash
 # Launch interactive REPL
 shipwright
 
-# Quick hire from the command line
-shipwright hire backend "Add Stripe payments"
-
-# Check on your crews
+# Or quick-hire from the command line
+shipwright hire backend-dev
+shipwright assign Alex "Add Stripe payments"
 shipwright status
 ```
 
-Inside the REPL, the flow is conversational:
+Inside the REPL:
 
 ```
-shipwright> hire frontend Redesign the settings page
-[frontend-redesign-the-settings-page] Crew hired!
+shipwright > roles
+  Available roles:
+    architect, backend-dev, frontend-dev, fullstack-dev, db-engineer,
+    qa-engineer, devops-engineer, security-auditor, tech-writer, designer,
+    team-lead, vp-engineering
 
-Lead: I'll take a look at the existing settings page first. Let me have the
-      UI Designer audit the current layout while the Frontend Dev checks the
-      component structure.
-      ...
+shipwright > hire backend-dev
+  Hired Alex as Backend Developer (idle)
 
-shipwright> The color scheme should match our new brand guidelines
-Lead: Got it. Can you share the brand colors, or should I extract them from
-      your existing CSS variables?
+shipwright > hire backend-dev as "Kai"
+  Hired Kai as Backend Developer (idle)
+
+shipwright > assign Alex "Build the checkout API"
+  Alex is working...
+  Alex done (45.1s)
+
+shipwright > talk Alex
+  [Alex/Backend Developer] > How did it go?
+
+  Alex: Done. I added three endpoints — create-intent, confirm, and webhook.
+        The webhook handler verifies Stripe signatures and updates order
+        status. Want me to add tests?
 ```
 
 ---
 
 ## Features
 
-### Crew-Based Model
+### Persistent Employees
 
-Instead of a single AI agent, Shipwright organizes work into **crews** — teams of specialized AI developers led by a coordinator. You talk to the **Crew Lead**, who understands the big picture, asks the right questions, and delegates implementation to the right team members.
-
-```
-You ↔ Crew Lead ↔ Architect
-                 ↔ Frontend Dev
-                 ↔ Backend Dev
-                 ↔ DB Engineer
-```
-
-The lead thinks about sequencing, integration points, and trade-offs. Members focus on their specialty. This mirrors how real engineering teams work.
-
-### Built-in Crews
-
-| Crew | Members | Best For |
-|------|---------|----------|
-| **fullstack** | Architect, Frontend Dev, Backend Dev, DB Engineer | End-to-end features |
-| **frontend** | UI Designer, Frontend Dev, CSS Specialist | UI/UX work |
-| **backend** | API Architect, Backend Dev, DB Engineer | APIs, services, data |
-| **qa** | Test Engineer, Manual Tester, Performance Tester | Testing and quality |
-| **devops** | Infra Engineer, CI/CD Specialist, Monitoring | Infrastructure and deployment |
-| **security** | Security Auditor, Penetration Tester | Security audits and hardening |
-| **docs** | Technical Writer, API Docs Specialist | Documentation |
-| **enterprise** | Project Lead → sub-crews | Large cross-domain projects |
-
-Each member has a rich, senior-level system prompt with engineering philosophy, patterns, anti-patterns, and code review standards — not just a one-liner.
-
-### Conversational Interface
-
-Crew leads are not passive relays. They:
-
-- Ask clarifying questions before starting work
-- Propose approaches and trade-offs with recommendations
-- Push back on requests that create tech debt
-- Report progress as members complete tasks
-- Iterate on your feedback
-
-### Delegation
-
-When the lead decides work needs to happen, it delegates to members using structured blocks:
+Unlike fire-and-forget agents, Shipwright employees persist. Each employee maintains a Claude Code SDK session — they remember past tasks, conversations, and codebase context. The more an employee works, the more effective they become.
 
 ```
-[DELEGATE:architect]
-Explore the codebase and identify all payment-related code.
-Look for existing Stripe integrations or payment models.
-[/DELEGATE]
+shipwright > assign Nori "Explore the codebase"
+  ...done
 
-[DELEGATE:backend]
-Implement the /api/checkout endpoint using the architect's spec.
-[/DELEGATE]
+shipwright > assign Nori "Review what Quinn built"
+  Nori already knows the codebase from the first task — no re-exploration needed.
 ```
 
-Multiple delegations run in parallel. Results feed back to the lead, who can delegate additional rounds (up to 5 per chat interaction).
+### Teams & Delegation
 
-### Enterprise Mode
-
-For large projects that span multiple domains, enterprise mode adds a third level:
+Organize employees into teams with leads who coordinate work:
 
 ```
-You ↔ Project Lead ↔ Backend Crew (Lead + Members)
-                   ↔ Frontend Crew (Lead + Members)
-                   ↔ DevOps Crew (Lead + Members)
+shipwright > team create backend
+  Created team 'backend'
+
+shipwright > promote Quinn to lead of backend
+  Quinn is now Team Lead of 'backend'
+
+shipwright > assign Kai to backend
+  Kai added to team 'backend'
+
+shipwright > assign backend "Add Stripe payment processing"
+  Quinn (Team Lead): Got it. I'll have Kai build the API endpoints.
+  Let me review the architecture first.
+  Kai working on: Payment API endpoints
+  ...
 ```
 
-```bash
-shipwright hire enterprise "Build complete SaaS billing system"
-```
+When work is assigned to a team, the lead breaks it into sub-tasks, delegates to members in parallel, reviews results, and synthesizes a response. Up to 5 delegation rounds per interaction.
 
-The Project Lead analyzes scope, spawns sub-crews as needed, and coordinates between them. Each sub-crew operates independently with its own lead and members. Hard-capped at 3 levels deep.
+### Built-in Roles
 
-### Plugin System
+| Role | Description | Best For |
+|------|-------------|----------|
+| **architect** | Explores codebase, writes specs, designs systems | Architecture, planning |
+| **backend-dev** | Implements APIs, services, business logic | Server-side features |
+| **frontend-dev** | Builds UI components, pages | Client-side features |
+| **fullstack-dev** | Both frontend and backend | End-to-end features |
+| **db-engineer** | Schemas, migrations, query optimization | Data layer |
+| **qa-engineer** | Writes and runs tests | Testing and quality |
+| **devops-engineer** | Infra, CI/CD, deployment | Infrastructure |
+| **security-auditor** | Security review, pen testing | Security hardening |
+| **tech-writer** | Documentation, API docs | Documentation |
+| **designer** | UI/UX design, component design | Design |
+| **team-lead** | Coordinates a group of employees | Team management |
+| **vp-engineering** | Coordinates team leads | Large projects |
 
-Extend Shipwright with custom crews and specialists.
+Each role has a rich, senior-level system prompt with engineering philosophy, patterns, anti-patterns, and standards.
 
-**Specialists** are domain experts you can recruit into any active crew:
+### Claude Code SDK Integration
 
-```bash
-# List what's installed
-shipwright> installed
+Every employee is a Claude Code SDK session. Shipwright uses your local Claude Code installation and existing subscription — no extra API costs. Employees get role-appropriate tools:
 
-# Recruit a specialist into an active crew
-shipwright> recruit stripe-specialist into backend-payments
+- **Architects** get read-only tools (Read, Glob, Grep) for exploration
+- **Developers** get write tools (Read, Edit, Write, Bash) for implementation
+- **Team leads** get read-only tools for coordination
 
-# Inspect a crew or specialist
-shipwright> inspect stripe-specialist
-```
+### Git Worktree Isolation
 
-See [Creating Custom Crews](#creating-custom-crews) for the full format.
+All work happens in an isolated git worktree on a dedicated branch (`shipwright/company`). The main branch stays clean, and completed work ships as a PR.
 
 ### Multiple Interfaces
 
-- **Interactive CLI** — REPL with markdown rendering, tab completion, readline history, streaming output, and delegation progress
-- **Telegram Bot** — Per-chat crew management with user allowlisting
-- **Discord Bot** — Per-channel crew management with `!` command prefix
-
 ```bash
 shipwright                # Interactive REPL
-shipwright --telegram     # Telegram bot mode
-shipwright --discord      # Discord bot mode
+shipwright --telegram     # Telegram bot (per-chat state)
+shipwright --discord      # Discord bot (per-channel state)
 ```
 
-### Persistent State
+### Sessions
 
-Crews survive restarts. Conversation history, active crews, task records, and session IDs are saved to `.shipwright/state/` and restored automatically. Each interface (CLI, Telegram chat, Discord channel) maintains independent state.
+Save and restore your company state across restarts:
+
+```
+shipwright > save
+shipwright > sessions
+shipwright > session save my-project
+shipwright > session load my-project
+```
+
+Or use named sessions from the command line:
+
+```bash
+shipwright --session my-project
+```
+
+---
+
+## CLI Command Reference
+
+### Shell Commands
+
+```bash
+shipwright                              # Interactive REPL
+shipwright --session <name>             # Use a named session
+shipwright hire <role>                  # Quick hire
+shipwright hire <role> as "Name"        # Hire with custom name
+shipwright assign <name> "<task>"       # Assign work
+shipwright talk <name>                  # Talk to employee
+shipwright fire <name>                  # Fire employee
+shipwright status                       # Company overview
+shipwright team                         # Team overview
+shipwright sessions                     # List saved sessions
+shipwright --telegram                   # Telegram bot mode
+shipwright --discord                    # Discord bot mode
+```
+
+### REPL Commands
+
+| Command | Aliases | Description |
+|---------|---------|-------------|
+| `roles` | | List available roles to hire |
+| `hire <role>` | | Hire an employee with auto-generated name |
+| `hire <role> as "Name"` | | Hire with a custom name |
+| `fire <name>` | | Fire an employee |
+| `fire <team>` | | Fire an entire team and all members |
+| `team` | `teams`, `company`, `org` | Show company overview |
+| `team create <name>` | | Create a new team |
+| `promote <name> to lead of <team>` | | Promote an employee to team lead |
+| `assign <name> to <team>` | | Add an employee to a team |
+| `assign <name> "<task>"` | | Assign work to an employee |
+| `assign <team> "<task>"` | | Assign work to a team (lead coordinates) |
+| `talk <name>` | | Switch conversation to an employee |
+| `status` | `overview`, `board` | Company overview with status |
+| `costs` | `cost`, `spending`, `budget` | Cost report per employee |
+| `history <name>` | | Task history for an employee |
+| `ship` | `pr` | Open a PR for all work |
+| `ship <team>` | | Open a PR for a team's work |
+| `save` | | Save current state |
+| `session save <name>` | | Save as a named session |
+| `session load <name>` | | Load a named session |
+| `session clear` | `session reset` | Clear current session |
+| `sessions` | `session list` | List saved sessions |
+| `shop` | `browse`, `marketplace`, `available` | Browse all available roles |
+| `installed` | `plugins`, `custom` | List installed custom plugins |
+| `inspect <name>` | | Show details for a role or specialist |
+| `help` | `?`, `commands` | Show available commands |
+
+Any text that isn't a command is sent as a message to the active employee.
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────┐
-│                   User Message                    │
-└──────────────┬───────────────────────────────────┘
-               │
-┌──────────────▼───────────────────────────────────┐
-│         Interface (CLI / Telegram / Discord)       │
-└──────────────┬───────────────────────────────────┘
-               │
-┌──────────────▼───────────────────────────────────┐
-│           Router (command parsing + routing)       │
-│  hire, fire, status, talk, ship, shop, recruit    │
-└──────────────┬───────────────────────────────────┘
-               │
-┌──────────────▼───────────────────────────────────┐
-│           Crew (orchestration + delegation)        │
-│  delegation loop, parallel execution, worktrees   │
-└──────────┬───────────────┬───────────────────────┘
-           │               │
-┌──────────▼──────┐ ┌──────▼──────────────────────┐
-│   Crew Lead     │ │   Members (Architect, Dev,   │
-│ (conversation,  │ │   DB Engineer, etc.)         │
-│  coordination)  │ │   Each a Claude Code session  │
-└─────────────────┘ └──────────────────────────────┘
+User
+ │
+ ▼
+Interface (CLI / Telegram / Discord)
+ │
+ ▼
+Router (command parsing + dispatch)
+ │
+ ▼
+Company (employees, teams, work assignment)
+ ├── Employee (wraps Claude Code SDK session)
+ │     ├── Individual work (run tasks directly)
+ │     └── Team lead work (delegate to members)
+ └── Team (optional org structure)
+       ├── Lead (coordinates)
+       └── Members (execute)
 ```
 
-### Module Breakdown
+### Module Layout
 
 ```
 shipwright/
 ├── main.py                  # CLI entry point, arg parsing
 ├── config.py                # Config loading (env + YAML + plugins)
 ├── sdk_patch.py             # Monkey-patch SDK for unknown message types
-├── crew/
-│   ├── registry.py          # Built-in crews + custom crew resolution
-│   ├── crew.py              # Crew + EnterpriseCrew orchestration
-│   ├── member.py            # CrewMember — wraps Claude Code SDK session
-│   └── lead.py              # CrewLead — conversational coordinator
+├── company/
+│   ├── company.py           # Company — manages employees and teams
+│   ├── employee.py          # Employee — wraps Claude Code SDK session
+│   └── roles.py             # Built-in role definitions
 ├── conversation/
 │   ├── session.py           # Message history and conversation state
 │   └── router.py            # Command parsing + message routing
@@ -229,7 +275,7 @@ shipwright/
 │   ├── git.py               # Git worktree management, PR creation
 │   └── project.py           # Project discovery (languages, frameworks)
 ├── interfaces/
-│   ├── cli.py               # Interactive REPL with markdown rendering
+│   ├── cli.py               # Interactive REPL with streaming output
 │   ├── telegram.py          # Telegram bot (per-chat state)
 │   └── discord.py           # Discord bot (per-channel state)
 ├── persistence/
@@ -238,70 +284,91 @@ shipwright/
     └── logging.py           # Structured logging
 ```
 
-### Claude Code SDK Integration
-
-Every crew member and crew lead is a Claude Code SDK session. Shipwright doesn't call the Anthropic API directly — it uses the local Claude Code installation and your existing subscription. No extra API costs.
+### Key Data Models
 
 ```python
-from claude_code_sdk import query, ClaudeCodeOptions
+Employee:
+    name: str                # Display name (auto-generated or chosen)
+    role: str                # Role ID (architect, backend-dev, etc.)
+    status: EmployeeStatus   # idle, working, blocked
+    team: str | None         # Team name if assigned
+    is_lead: bool            # Whether this employee is a team lead
+    task_history: list[Task] # Completed tasks
+    session_id: str | None   # SDK session for memory continuity
+    cost_total_usd: float    # Accumulated cost
 
-async for message in query(
-    prompt="Implement the checkout endpoint",
-    options=ClaudeCodeOptions(
-        allowed_tools=["Read", "Edit", "Write", "Bash"],
-        permission_mode="bypassPermissions",
-        max_turns=50,
-        model="claude-sonnet-4-6",
-        system_prompt="You are a senior backend developer...",
-        cwd="/path/to/worktree",
-    ),
-):
-    # TextBlock, ToolUseBlock, ThinkingBlock, ResultMessage
-    pass
+Team:
+    name: str                # Team name
+    lead: str | None         # Employee name of the lead
+    members: list[str]       # Employee names
+
+Company:
+    employees: dict          # All employees by name
+    teams: dict              # All teams by name
+    project_context: str     # Discovered project info
 ```
 
-Leads get read-only tools (Read, Glob, Grep) so they can explore the codebase without modifying it. Members get write tools appropriate to their role.
+### How Delegation Works
+
+When work is assigned to a team:
+
+1. The team lead receives the task
+2. Lead analyzes and responds with `[DELEGATE:member_name]` blocks
+3. Delegated tasks execute in parallel
+4. Results feed back to the lead
+5. Lead either delegates more work or responds to the user
+6. Loop continues up to 5 rounds
+
+```
+[DELEGATE:kai]
+Build the /api/checkout endpoint with PaymentIntent creation.
+[/DELEGATE]
+
+[DELEGATE:reese]
+Implement the Stripe webhook handler for payment confirmation.
+[/DELEGATE]
+```
 
 ---
 
-## Creating Custom Crews
+## Custom Roles via Plugins
 
-### Plugin Directory Structure
+Extend Shipwright with custom roles and specialists.
 
-Place custom crews and specialists in either location:
+### Plugin Directories
 
 ```
-./shipwright/crews/       # Project-local (takes priority)
+./shipwright/crews/       # Project-local (highest priority)
 ~/.shipwright/crews/      # User-global
 ```
 
 Each plugin is a directory with a `crew.yaml`:
 
 ```
-my-specialist/
+stripe-specialist/
 ├── crew.yaml
-└── references/          # Optional: docs loaded into member context
+└── references/          # Optional: docs loaded into context
     ├── api-guide.md
     └── patterns.md
 ```
 
-### Specialist Definition
+### Defining a Custom Role
 
 ```yaml
-kind: specialist
+kind: role
 name: stripe-specialist
+role: Stripe Specialist
 description: "Expert in Stripe payments integration"
-role: "Stripe Payments Specialist"
 prompt: |
   You are an expert in Stripe payments integration. You know the Stripe API
   inside out — PaymentIntents, Checkout Sessions, Webhooks, Subscriptions.
   Always use the latest Stripe API patterns.
 tools: [Read, Edit, Write, Bash, Glob, Grep]
 max_turns: 60
-references: true   # Loads ./references/*.md into member context
+references: true   # Loads ./references/*.md into context
 ```
 
-### Crew Definition
+### Defining a Team Template
 
 ```yaml
 kind: crew
@@ -321,72 +388,12 @@ members:
     max_turns: 80
 ```
 
-### YAML Config (Alternative)
-
-Define custom crews in `shipwright.yaml` or `shipwright.yml` at your project root:
-
-```yaml
-crews:
-  my-crew:
-    lead: "Senior tech lead for custom work"
-    members:
-      developer:
-        role: "Developer"
-        prompt: "You are a developer specializing in..."
-        tools: [Read, Edit, Write, Bash]
-        max_turns: 80
-        model: claude-sonnet-4-6   # Optional per-member model override
-```
-
-### References System
-
-Specialists with `references: true` automatically load all `.md` files from a `references/` directory alongside their `crew.yaml`. This is useful for bundling API docs, coding patterns, or domain knowledge that the specialist should have in context.
-
 ### Resolution Order
 
-When looking up a crew or specialist by name:
-
-1. **Project-local** — `./shipwright/crews/`
-2. **User-global** — `~/.shipwright/crews/`
-3. **YAML config** — `./shipwright.yaml`
-4. **Built-in** — Hardcoded crew definitions
-
-Project-local always wins, letting you override built-in crews per-project.
-
----
-
-## CLI Commands Reference
-
-### From the Shell
-
-```bash
-shipwright                          # Interactive REPL
-shipwright hire <type> <objective>  # Quick hire a crew
-shipwright status                   # Show active crews
-shipwright talk <crew-id>           # Talk to a specific crew
-shipwright fire <crew-id>           # Dismiss a crew
-shipwright --telegram               # Run Telegram bot
-shipwright --discord                # Run Discord bot
-shipwright "<message>"              # Send message to active crew
-```
-
-### Inside the REPL
-
-| Command | Aliases | Description |
-|---------|---------|-------------|
-| `hire <type> <objective>` | `start`, `create` | Hire a new crew |
-| `fire <crew-id>` | `dismiss`, `stop`, `remove` | Dismiss a crew and clean up its worktree |
-| `status` | `crews`, `list`, `board` | Show all active crews |
-| `talk to <crew-id>` | `switch to`, `use` | Switch active crew |
-| `log <crew-id>` | `history` | Show conversation history for a crew |
-| `ship` | `pr`, `open pr`, `create pr` | Create a PR from the active crew's work |
-| `shop` | `browse`, `marketplace`, `available` | List all available crew types |
-| `installed` | `plugins`, `custom` | List installed custom crews and specialists |
-| `inspect <name>` | | Show detailed info about a crew or specialist |
-| `recruit <specialist> into <crew-id>` | | Add a specialist to an active crew |
-| `help` | `?`, `commands` | Show available commands |
-
-Any text that isn't a command is sent as a message to the active crew.
+1. **Project-local** `./shipwright/crews/`
+2. **User-global** `~/.shipwright/crews/`
+3. **YAML config** `./shipwright.yaml`
+4. **Built-in** roles
 
 ---
 
@@ -403,8 +410,8 @@ SHIPWRIGHT_MODEL=claude-sonnet-4-6
 # Permission mode for Claude Code SDK (default: bypassPermissions)
 SHIPWRIGHT_PERMISSION_MODE=bypassPermissions
 
-# Max QA fix cycles (default: 3)
-MAX_FIX_ATTEMPTS=3
+# Budget limit in USD (default: 0 = no limit)
+BUDGET_LIMIT_USD=50
 
 # Project root override (default: current directory)
 REPO_ROOT=/path/to/project
@@ -421,63 +428,30 @@ DISCORD_CHANNEL_ID=your-channel-id
 
 ### shipwright.yaml
 
-Project-level configuration for custom crews. Placed at the project root. See [Creating Custom Crews](#creating-custom-crews) for the full format.
+Project-level configuration for custom crews, placed at the project root:
 
-### Plugin Directories
-
-```
-./shipwright/crews/      # Project-local plugins (highest priority)
-~/.shipwright/crews/     # User-global plugins
-```
-
-Each subdirectory containing a `crew.yaml` is automatically discovered and loaded.
-
----
-
-## How It Works
-
-### The Delegation Loop
-
-Every `chat()` interaction follows this loop:
-
-1. User message is sent to the **Crew Lead** (a Claude Code SDK session with read-only tools)
-2. Lead responds — possibly with `[DELEGATE:member_name]` blocks
-3. Delegation blocks are parsed and executed (parallel if multiple)
-4. Member results are fed back to the lead as context
-5. Lead responds again — may delegate more work or respond to the user
-6. Loop continues until no delegations remain or 5 rounds are reached
-
-```
-User message
-    → Lead responds (may delegate)
-        → Members execute tasks
-            → Results fed back to lead
-                → Lead responds (may delegate again)
-                    → ... (up to 5 rounds)
-                        → Final response to user
+```yaml
+crews:
+  my-crew:
+    lead: "Senior tech lead for custom work"
+    members:
+      developer:
+        role: "Developer"
+        prompt: "You are a developer specializing in..."
+        tools: [Read, Edit, Write, Bash]
+        max_turns: 80
+        model: claude-sonnet-4-6
 ```
 
-### SDK Patch
+### State & Sessions
 
-The Claude Code SDK raises `MessageParseError` for unknown message types like `rate_limit_event`, which kills the async stream. Shipwright monkey-patches `parse_message` to return `None` for unknown types instead, allowing the stream to continue gracefully. Applied once at import time via `shipwright/sdk_patch.py`.
-
-### Git Worktree Isolation
-
-Each crew works in its own git worktree on a dedicated branch (`shipwright/<crew-id>`):
-
-- Multiple crews can work simultaneously without conflicts
-- The main branch stays clean
-- Each crew's work can be shipped as a separate PR
-- Worktrees are cleaned up automatically when a crew is dismissed
-
-Enterprise mode creates nested branches: `shipwright/enterprise-xxx/backend`, etc.
+State is saved to `~/.shipwright/sessions/` and restored automatically. Each interface (CLI, Telegram chat, Discord channel) maintains independent state.
 
 ---
 
 ## Contributing
 
 ```bash
-# Clone and install in dev mode
 git clone https://github.com/your-org/shipwright.git
 cd shipwright
 pip install -e ".[all]"
