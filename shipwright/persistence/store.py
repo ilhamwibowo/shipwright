@@ -1,7 +1,7 @@
 """Persistence — save and restore crews, conversations, and state.
 
-State is stored as JSON files in .shipwright/state/ within the project root.
-Each session (CLI, Telegram, Discord) gets its own state file.
+State is stored as JSON files in ~/.shipwright/sessions/.
+Each session gets its own state file: ~/.shipwright/sessions/<name>.json
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ logger = logging.getLogger("shipwright.persistence")
 
 
 def _state_path(config: Config, session_id: str) -> Path:
-    return config.state_dir / f"{session_id}.json"
+    return config.sessions_dir / f"{session_id}.json"
 
 
 def save_state(data: dict, config: Config, session_id: str = "default") -> None:
@@ -58,8 +58,8 @@ def clear_state(config: Config, session_id: str = "default") -> None:
 
 def list_sessions(config: Config) -> list[str]:
     """List all saved session IDs."""
-    if not config.state_dir.exists():
+    if not config.sessions_dir.exists():
         return []
     return [
-        p.stem for p in config.state_dir.glob("*.json")
+        p.stem for p in config.sessions_dir.glob("*.json")
     ]

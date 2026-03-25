@@ -75,7 +75,13 @@ class Crew:
     task_records: list[TaskRecord] = field(default_factory=list)
     created_at: float = field(default_factory=time.time)
     pr_url: str | None = None
+    _stale_worktree: str | None = field(default=None, repr=False)
     _on_update: Callable[[str], None] | None = field(default=None, repr=False)
+
+    @property
+    def is_stale(self) -> bool:
+        """True if this crew had a worktree that no longer exists on disk."""
+        return self._stale_worktree is not None
 
     def __post_init__(self) -> None:
         self.lead = CrewLead(
@@ -485,10 +491,15 @@ class Crew:
     @property
     def summary(self) -> str:
         """Human-readable summary of crew state."""
-        parts = [f"**{self.id}** [{self.status.value}]"]
+        status_label = self.status.value
+        if self.is_stale:
+            status_label = "stale"
+        parts = [f"**{self.id}** [{status_label}]"]
         parts.append(f"  Objective: {self.objective}")
         if self.branch:
             parts.append(f"  Branch: `{self.branch}`")
+        if self.is_stale:
+            parts.append(f"  Worktree: STALE (was: {self._stale_worktree})")
         if self.pr_url:
             parts.append(f"  PR: {self.pr_url}")
 
@@ -505,13 +516,20 @@ class Crew:
 
     def to_dict(self) -> dict:
         """Serialize crew state for persistence."""
+        # Preserve original worktree path even when stale (for re-detection)
+        wt_str = None
+        if self.worktree_path:
+            wt_str = str(self.worktree_path)
+        elif self._stale_worktree:
+            wt_str = self._stale_worktree
+
         return {
             "id": self.id,
             "crew_type": self.crew_type,
             "objective": self.objective,
             "status": self.status.value,
             "branch": self.branch,
-            "worktree_path": str(self.worktree_path) if self.worktree_path else None,
+            "worktree_path": wt_str,
             "pr_url": self.pr_url,
             "created_at": self.created_at,
             "lead": self.lead.to_dict(),
@@ -542,7 +560,15 @@ class Crew:
         crew.status = CrewStatus(data.get("status", "idle"))
         crew.branch = data.get("branch")
         wt = data.get("worktree_path")
-        crew.worktree_path = Path(wt) if wt and Path(wt).exists() else None
+        if wt:
+            if Path(wt).exists():
+                crew.worktree_path = Path(wt)
+            else:
+                crew._stale_worktree = wt
+                logger.warning(
+                    "Crew %s: worktree %s no longer exists (marked stale)",
+                    crew.id, wt,
+                )
         crew.pr_url = data.get("pr_url")
         crew.created_at = data.get("created_at", time.time())
 
@@ -793,7 +819,15 @@ class EnterpriseCrew(Crew):
         crew.status = CrewStatus(data.get("status", "idle"))
         crew.branch = data.get("branch")
         wt = data.get("worktree_path")
-        crew.worktree_path = Path(wt) if wt and Path(wt).exists() else None
+        if wt:
+            if Path(wt).exists():
+                crew.worktree_path = Path(wt)
+            else:
+                crew._stale_worktree = wt
+                logger.warning(
+                    "EnterpriseCrew %s: worktree %s no longer exists (marked stale)",
+                    crew.id, wt,
+                )
         crew.pr_url = data.get("pr_url")
         crew.created_at = data.get("created_at", time.time())
         crew.depth = data.get("depth", 1)

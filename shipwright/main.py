@@ -10,6 +10,9 @@
   shipwright crews
   shipwright status
 
+  # Named sessions
+  shipwright --session myproject
+
   # Bot modes
   shipwright --telegram
   shipwright --discord
@@ -25,6 +28,21 @@ from shipwright.config import load_config
 from shipwright.utils.logging import setup_logging
 
 
+def _extract_session_flag(args: list[str]) -> tuple[str, list[str]]:
+    """Extract --session <name> from args. Returns (session_name, remaining_args)."""
+    if "--session" not in args:
+        return "default", args
+
+    idx = args.index("--session")
+    if idx + 1 >= len(args):
+        print("Error: --session requires a name argument.", file=sys.stderr)
+        sys.exit(1)
+
+    session_name = args[idx + 1]
+    remaining = args[:idx] + args[idx + 2:]
+    return session_name, remaining
+
+
 def main() -> None:
     setup_logging()
 
@@ -33,11 +51,14 @@ def main() -> None:
 
     args = sys.argv[1:]
 
+    # Extract --session flag before processing other args
+    session_name, args = _extract_session_flag(args)
+
     if not args:
         # Interactive REPL mode
         config = load_config()
         from shipwright.interfaces.cli import run_repl
-        asyncio.run(run_repl(config))
+        asyncio.run(run_repl(config, session_name=session_name))
         return
 
     if args[0] == "--telegram":
@@ -64,9 +85,14 @@ def main() -> None:
         _print_help()
         return
 
+    if args[0] == "sessions":
+        config = load_config()
+        _list_sessions(config)
+        return
+
     if args[0] == "crews" or args[0] == "status":
         config = load_config()
-        _show_status(config)
+        _show_status(config, session_name)
         return
 
     if args[0] == "hire" and len(args) >= 3:
@@ -74,29 +100,28 @@ def main() -> None:
         crew_type = args[1]
         objective = " ".join(args[2:])
         from shipwright.interfaces.cli import run_oneshot
-        asyncio.run(run_oneshot(config, f"hire {crew_type} {objective}"))
+        asyncio.run(run_oneshot(config, f"hire {crew_type} {objective}", session_name))
         return
 
     if args[0] == "talk" and len(args) >= 2:
         config = load_config()
-        # Enter REPL with a specific crew active
         from shipwright.interfaces.cli import run_oneshot
         crew_id = " ".join(args[1:])
-        asyncio.run(run_oneshot(config, f"talk to {crew_id}"))
+        asyncio.run(run_oneshot(config, f"talk to {crew_id}", session_name))
         return
 
     if args[0] == "fire" and len(args) >= 2:
         config = load_config()
         crew_id = " ".join(args[1:])
         from shipwright.interfaces.cli import run_oneshot
-        asyncio.run(run_oneshot(config, f"fire {crew_id}"))
+        asyncio.run(run_oneshot(config, f"fire {crew_id}", session_name))
         return
 
     # Anything else is treated as a message to the active crew
     config = load_config()
     message = " ".join(args)
     from shipwright.interfaces.cli import run_oneshot
-    sys.exit(asyncio.run(run_oneshot(config, message)))
+    sys.exit(asyncio.run(run_oneshot(config, message, session_name)))
 
 
 def _print_help() -> None:
@@ -104,13 +129,21 @@ def _print_help() -> None:
 
 Usage:
   shipwright                          Interactive REPL (main mode)
+  shipwright --session <name>         Use a named session (default: default)
   shipwright hire <type> <objective>  Quick hire a crew
   shipwright status                   Show active crews
+  shipwright sessions                 List all saved sessions
   shipwright talk <crew-id>           Talk to a specific crew
   shipwright fire <crew-id>           Dismiss a crew
   shipwright --telegram               Run Telegram bot
   shipwright --discord                Run Discord bot
   shipwright "<message>"              Send a message to active crew
+
+Session management (in REPL):
+  sessions                            List all saved sessions
+  session save <name>                 Save current state as a named session
+  session load <name>                 Load a named session
+  session clear                       Clear current session state
 
 Available crew types: fullstack, frontend, backend, qa, devops, security, docs, enterprise
 
@@ -120,16 +153,16 @@ Enterprise mode (3-level hierarchy):
 Examples:
   shipwright hire backend "Add Stripe payments"
   shipwright hire frontend "Redesign the dashboard"
-  shipwright hire enterprise "Build complete SaaS billing"
+  shipwright --session myproject hire backend "Add payments"
   shipwright "What's the status?"
 """)
 
 
-def _show_status(config: "Config") -> None:
+def _show_status(config: "Config", session_name: str = "default") -> None:
     from shipwright.persistence.store import load_state
     from shipwright.conversation.router import Router
 
-    saved = load_state(config, session_id="cli")
+    saved = load_state(config, session_id=session_name)
     if not saved:
         print("No active crews.")
         return
@@ -142,6 +175,19 @@ def _show_status(config: "Config") -> None:
     for crew in router.crews.values():
         print(crew.summary)
         print()
+
+
+def _list_sessions(config: "Config") -> None:
+    from shipwright.persistence.store import list_sessions
+
+    sessions = list_sessions(config)
+    if not sessions:
+        print("No saved sessions.")
+        return
+
+    print("Saved sessions:")
+    for name in sorted(sessions):
+        print(f"  {name}")
 
 
 if __name__ == "__main__":

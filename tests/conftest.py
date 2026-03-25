@@ -15,6 +15,7 @@ def config(tmp_path: Path) -> Config:
         repo_root=tmp_path,
         max_fix_attempts=2,
         model="claude-sonnet-4-6",
+        sessions_dir=tmp_path / "sessions",
     )
 
 

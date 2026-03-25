@@ -24,6 +24,12 @@ from shipwright.crew.registry import (
     list_installed,
     list_specialists,
 )
+from shipwright.persistence.store import (
+    clear_state,
+    list_sessions,
+    load_state,
+    save_state,
+)
 from shipwright.utils.logging import get_logger
 from shipwright.workspace.project import ProjectInfo, discover_project
 
@@ -41,6 +47,7 @@ class Router:
     config: Config
     session: Session
     crews: dict[str, Crew] = field(default_factory=dict)
+    session_name: str = "default"
     _project_info: ProjectInfo | None = field(default=None, repr=False)
 
     @property
@@ -167,6 +174,26 @@ class Router:
             crew_id = recruit_match.group(2).strip()
             return True, self._recruit(specialist_name, crew_id)
 
+        # sessions / session list
+        if lower in ("sessions", "session list"):
+            return True, self._list_sessions()
+
+        # session save <name>
+        session_save_match = re.match(r"^session\s+save\s+(.+)$", lower)
+        if session_save_match:
+            name = text[len("session save "):].strip()
+            return True, self._session_save(name)
+
+        # session load <name>
+        session_load_match = re.match(r"^session\s+load\s+(.+)$", lower)
+        if session_load_match:
+            name = text[len("session load "):].strip()
+            return True, self._session_load(name)
+
+        # session clear
+        if lower in ("session clear", "session reset"):
+            return True, self._session_clear()
+
         return False, ""
 
     def _hire_crew(self, crew_type: str, objective: str) -> str:
@@ -292,6 +319,10 @@ class Router:
             "  `installed` — List custom/installed crews\n"
             "  `inspect <name>` — Show crew/specialist details\n"
             "  `recruit <specialist> into <crew-id>` — Add specialist to a crew\n"
+            "  `sessions` — List all saved sessions\n"
+            "  `session save <name>` — Save current state as a named session\n"
+            "  `session load <name>` — Load a named session\n"
+            "  `session clear` — Clear current session state\n"
             "  `help` — Show this help\n\n"
             "Or just type naturally — messages go to the active crew lead."
         )
@@ -428,6 +459,62 @@ class Router:
             f"The crew lead can now delegate work to `{member_name}`."
         )
 
+    def _list_sessions(self) -> str:
+        """List all saved sessions."""
+        sessions = list_sessions(self.config)
+        if not sessions:
+            return "No saved sessions."
+        lines = ["**Saved Sessions**\n"]
+        for name in sorted(sessions):
+            marker = " (active)" if name == self.session_name else ""
+            lines.append(f"  `{name}`{marker}")
+        return "\n".join(lines)
+
+    def _session_save(self, name: str) -> str:
+        """Save current state to a named session."""
+        save_state(self.to_dict(), self.config, session_id=name)
+        return f"Session saved as **{name}**."
+
+    def _session_load(self, name: str) -> str:
+        """Load a named session, replacing current state."""
+        data = load_state(self.config, session_id=name)
+        if not data:
+            return f"No session named '{name}' found."
+
+        # Replace session
+        self.session = Session.from_dict(
+            data.get("session", {"id": name})
+        )
+        self.crews.clear()
+
+        # Restore crews
+        stale_crews: list[str] = []
+        for cid, crew_data in data.get("crews", {}).items():
+            try:
+                crew_def = get_crew_def(crew_data["crew_type"], self.config)
+                if crew_data.get("is_enterprise"):
+                    crew = EnterpriseCrew.from_dict(crew_data, crew_def, self.config)
+                else:
+                    crew = Crew.from_dict(crew_data, crew_def, self.config)
+                self.crews[cid] = crew
+                if crew.is_stale:
+                    stale_crews.append(cid)
+            except (ValueError, KeyError) as e:
+                logger.warning("Failed to restore crew %s: %s", cid, e)
+
+        self.session_name = name
+        n = len(self.crews)
+        msg = f"Loaded session **{name}** with {n} crew(s)."
+        if stale_crews:
+            msg += f"\n\nWarning: {len(stale_crews)} crew(s) have stale worktrees: {', '.join(stale_crews)}"
+        return msg
+
+    def _session_clear(self) -> str:
+        """Clear current session — dismiss all crews and reset history."""
+        self.crews.clear()
+        self.session = Session(id=self.session.id)
+        return "Session cleared. All crews dismissed."
+
     def _suggest_hire(self, text: str) -> str:
         """When no active crew, suggest hiring one."""
         types = ", ".join(list_crew_types(self.config))
@@ -446,13 +533,15 @@ class Router:
         return {
             "session": self.session.to_dict(),
             "crews": {cid: c.to_dict() for cid, c in self.crews.items()},
+            "session_name": self.session_name,
         }
 
     @classmethod
     def from_dict(cls, data: dict, config: Config) -> "Router":
         """Restore router from persisted data."""
         session = Session.from_dict(data.get("session", {"id": "default"}))
-        router = cls(config=config, session=session)
+        session_name = data.get("session_name", "default")
+        router = cls(config=config, session=session, session_name=session_name)
 
         for cid, crew_data in data.get("crews", {}).items():
             try:

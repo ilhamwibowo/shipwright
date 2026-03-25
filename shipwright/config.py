@@ -69,6 +69,11 @@ class Config:
     # Specialists loaded from plugin directories
     custom_specialists: dict[str, SpecialistDef] = field(default_factory=dict)
 
+    # Session storage directory (default: ~/.shipwright/sessions/)
+    sessions_dir: Path = field(
+        default_factory=lambda: Path.home() / ".shipwright" / "sessions"
+    )
+
     @property
     def data_dir(self) -> Path:
         return self.repo_root / ".shipwright"

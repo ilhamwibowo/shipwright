@@ -65,6 +65,10 @@ _COMMANDS = [
     "log",
     "pr",
     "quit",
+    "session clear",
+    "session load",
+    "session save",
+    "sessions",
     "ship",
     "status",
     "switch to",
@@ -319,23 +323,41 @@ def _setup_completer(router: Router) -> None:
 # ---------------------------------------------------------------------------
 # REPL
 # ---------------------------------------------------------------------------
-async def run_repl(config: Config) -> None:
+async def run_repl(config: Config, session_name: str = "default") -> None:
     """Run the interactive REPL."""
     # Restore default signal handling so Ctrl+C works in the REPL
     signal.signal(signal.SIGINT, signal.default_int_handler)
 
     print(BANNER)
 
-    session = Session(id="cli")
+    session = Session(id=session_name)
 
     # Restore state if available
-    saved = load_state(config, session_id="cli")
+    saved = load_state(config, session_id=session_name)
     if saved:
         router = Router.from_dict(saved, config)
+        router.session_name = session_name
         if router.crews:
-            print(f"  Restored {len(router.crews)} crew(s) from previous session.\n")
+            print(f"  Restored {len(router.crews)} crew(s) from previous session.")
+            if session_name != "default":
+                print(f"  Session: {session_name}")
+            # Show stale worktree warnings
+            for crew in router.crews.values():
+                if crew.is_stale:
+                    print(
+                        f"  {YELLOW}Warning: {crew.id} worktree no longer exists "
+                        f"(marked stale){RESET}"
+                    )
+            # Show active crew info
+            if router.active_crew:
+                active = router.active_crew
+                print(
+                    f"  Active crew: {active.id} [{active.status.value}]"
+                )
+                print(f"  Objective: {active.objective}")
+            print()
     else:
-        router = Router(config=config, session=session)
+        router = Router(config=config, session=session, session_name=session_name)
 
     # Show available crew types
     types = list_crew_types(config)
@@ -363,7 +385,7 @@ async def run_repl(config: Config) -> None:
                 continue
 
             if line.lower() in ("quit", "exit", "q"):
-                save_state(router.to_dict(), config, session_id="cli")
+                save_state(router.to_dict(), config, session_id=router.session_name)
                 print(f"\n  {DIM}State saved. Goodbye!{RESET}")
                 break
 
@@ -413,7 +435,7 @@ async def run_repl(config: Config) -> None:
                 continue
 
             # Auto-save after each interaction
-            save_state(router.to_dict(), config, session_id="cli")
+            save_state(router.to_dict(), config, session_id=router.session_name)
 
             # Refresh completer with potentially new crews
             _setup_completer(router)
@@ -425,7 +447,7 @@ async def run_repl(config: Config) -> None:
 
         except EOFError:
             print()
-            save_state(router.to_dict(), config, session_id="cli")
+            save_state(router.to_dict(), config, session_id=router.session_name)
             break
 
         except Exception as exc:
@@ -434,15 +456,18 @@ async def run_repl(config: Config) -> None:
             print(f"\n  {RED}Error: {exc}{RESET}\n")
 
 
-async def run_oneshot(config: Config, message: str) -> int:
+async def run_oneshot(
+    config: Config, message: str, session_name: str = "default",
+) -> int:
     """Run a single message through the router (non-interactive mode)."""
-    session = Session(id="cli")
+    session = Session(id=session_name)
 
-    saved = load_state(config, session_id="cli")
+    saved = load_state(config, session_id=session_name)
     if saved:
         router = Router.from_dict(saved, config)
+        router.session_name = session_name
     else:
-        router = Router(config=config, session=session)
+        router = Router(config=config, session=session, session_name=session_name)
 
     print(f"\n  Message: {message}")
     print(f"  Model:   {config.model}")
@@ -473,5 +498,5 @@ async def run_oneshot(config: Config, message: str) -> int:
         print(f"  {DIM}Done in {elapsed:.1f}s{RESET}")
     print()
 
-    save_state(router.to_dict(), config, session_id="cli")
+    save_state(router.to_dict(), config, session_id=router.session_name)
     return 0
