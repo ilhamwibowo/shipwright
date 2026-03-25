@@ -44,7 +44,9 @@ def _extract_session_flag(args: list[str]) -> tuple[str, list[str]]:
 
 
 def main() -> None:
-    setup_logging()
+    # Suppress INFO logs in interactive CLI — only show warnings/errors
+    import logging
+    setup_logging(level=logging.WARNING)
 
     signal.signal(signal.SIGINT, lambda *_: None)  # Let asyncio handle it
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
