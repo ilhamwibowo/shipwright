@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from shipwright.config import Config, MemberDef
-from shipwright.company.company import Company, Team
+from shipwright.company.company import Company, Team, format_duration_ms
 from shipwright.company.employee import (
     Employee,
     EmployeeStatus,
@@ -437,3 +437,140 @@ class TestCostTracking:
     def test_total_cost_empty(self, config: Config):
         company = Company(config=config)
         assert company.total_cost == 0.0
+
+    def test_cost_report_shows_task_count_and_duration(self, config: Config):
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        emp.cost_total_usd = 0.15
+        emp.task_history.append(Task(
+            id="t1", description="Write API", assigned_to="Alex",
+            status="done", cost_usd=0.10, duration_ms=60000,
+        ))
+        emp.task_history.append(Task(
+            id="t2", description="Fix bug", assigned_to="Alex",
+            status="done", cost_usd=0.05, duration_ms=30000,
+        ))
+
+        report = company.cost_report
+        assert "2 tasks" in report
+        assert "1m 30s" in report
+        assert "$0.1500" in report
+        assert "Total" in report
+
+    def test_cost_report_single_task_label(self, config: Config):
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        emp.cost_total_usd = 0.05
+        emp.task_history.append(Task(
+            id="t1", description="Write API", assigned_to="Alex",
+            status="done", cost_usd=0.05, duration_ms=45000,
+        ))
+
+        report = company.cost_report
+        assert "1 task," in report
+
+    def test_cost_report_with_budget(self):
+        config = Config(
+            repo_root=Path("/tmp"),
+            budget_limit_usd=5.0,
+            sessions_dir=Path("/tmp/sessions"),
+        )
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        emp.cost_total_usd = 1.0
+        emp.task_history.append(Task(
+            id="t1", description="Work", assigned_to="Alex",
+            status="done", cost_usd=1.0, duration_ms=120000,
+        ))
+
+        report = company.cost_report
+        assert "Budget: $5.00" in report
+        assert "20%" in report
+
+    def test_status_summary_includes_cost(self, config: Config):
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        emp.cost_total_usd = 0.25
+
+        summary = company.status_summary
+        assert "$0.25" in summary
+
+
+# ---------------------------------------------------------------------------
+# Format Duration
+# ---------------------------------------------------------------------------
+
+
+class TestFormatDuration:
+    def test_zero(self):
+        assert format_duration_ms(0) == "0s"
+
+    def test_negative(self):
+        assert format_duration_ms(-100) == "0s"
+
+    def test_seconds(self):
+        assert format_duration_ms(45000) == "45s"
+
+    def test_minutes_and_seconds(self):
+        assert format_duration_ms(90000) == "1m 30s"
+
+    def test_exact_minutes(self):
+        assert format_duration_ms(120000) == "2m"
+
+    def test_hours_and_minutes(self):
+        assert format_duration_ms(3_660_000) == "1h 1m"
+
+    def test_exact_hours(self):
+        assert format_duration_ms(3_600_000) == "1h"
+
+
+# ---------------------------------------------------------------------------
+# Budget Limits
+# ---------------------------------------------------------------------------
+
+
+class TestBudgetLimits:
+    @pytest.mark.asyncio
+    async def test_budget_exceeded_blocks_work(self):
+        config = Config(
+            repo_root=Path("/tmp"),
+            budget_limit_usd=1.0,
+            sessions_dir=Path("/tmp/sessions"),
+        )
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        emp.cost_total_usd = 1.50  # Already over budget
+
+        result = await company.assign_work("Alex", "Do more work")
+        assert "Budget exceeded" in result
+        assert "$1.50" in result
+
+    @pytest.mark.asyncio
+    async def test_no_budget_allows_work(self, config: Config):
+        """When budget_limit_usd is 0 (default), no budget check."""
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        emp.cost_total_usd = 999.0
+
+        mock_result = MemberResult(output="Done.", total_cost_usd=0.01)
+        with patch.object(emp, "run", new_callable=AsyncMock, return_value=mock_result):
+            result = await company.assign_work("Alex", "Build something")
+
+        assert "Done." in result
+
+    @pytest.mark.asyncio
+    async def test_budget_not_exceeded_allows_work(self):
+        config = Config(
+            repo_root=Path("/tmp"),
+            budget_limit_usd=10.0,
+            sessions_dir=Path("/tmp/sessions"),
+        )
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        emp.cost_total_usd = 5.0  # Under budget
+
+        mock_result = MemberResult(output="Done.", total_cost_usd=0.50)
+        with patch.object(emp, "run", new_callable=AsyncMock, return_value=mock_result):
+            result = await company.assign_work("Alex", "Build something")
+
+        assert "Done." in result

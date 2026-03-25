@@ -212,6 +212,25 @@ class TestRouter:
             is_cmd, _ = router._try_sync_command(cmd, cmd)
             assert is_cmd, f"Command '{cmd}' not recognized"
 
+    def test_costs_command_shows_task_count(self, config: Config):
+        from shipwright.company.employee import Task
+
+        router = self._make_router(config)
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
+        emp_name = list(router.company.employees.keys())[0]
+        emp = router.company.employees[emp_name]
+        emp.cost_total_usd = 0.10
+        emp.task_history.append(Task(
+            id="t1", description="Write API", assigned_to=emp_name,
+            status="done", cost_usd=0.10, duration_ms=60000,
+        ))
+
+        is_cmd, response = router._try_sync_command("costs", "costs")
+        assert is_cmd
+        assert "1 task" in response
+        assert "$0.10" in response
+        assert "1m" in response
+
     def test_history_command(self, config: Config):
         router = self._make_router(config)
         router._try_sync_command("hire backend-dev", "hire backend-dev")

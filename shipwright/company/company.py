@@ -42,6 +42,24 @@ from shipwright.workspace.git import (
 logger = get_logger("company.company")
 
 
+def format_duration_ms(ms: int) -> str:
+    """Format milliseconds into a human-readable duration string."""
+    if ms <= 0:
+        return "0s"
+    seconds = ms / 1000
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    if minutes < 60:
+        return f"{minutes}m {secs}s" if secs else f"{minutes}m"
+    hours = int(minutes // 60)
+    mins = minutes % 60
+    if mins:
+        return f"{hours}h {mins}m"
+    return f"{hours}h"
+
+
 @dataclass
 class Team:
     """A team of employees with an optional lead."""
@@ -259,7 +277,16 @@ class Company:
 
         If target is an employee name, assigns directly.
         If target is a team name, assigns through the team lead.
+        Returns a warning string if budget is exceeded.
         """
+        budget = self.config.budget_limit_usd
+        if budget > 0 and self.total_cost >= budget:
+            return (
+                f"**Budget exceeded.** Spent ${self.total_cost:.4f} "
+                f"of ${budget:.2f} limit. "
+                f"Increase BUDGET_LIMIT_USD or dismiss employees to free budget."
+            )
+
         if target in self.employees:
             return await self._assign_to_employee(
                 target, task_description, on_text=on_text,
@@ -544,24 +571,55 @@ class Company:
                     status = f"working: {emp.current_task.description[:40]}"
                 lines.append(f"    {emp.name} ({emp.display_role}) — {status}")
 
+        # Cost summary
+        if self.total_cost > 0:
+            lines.append(f"\n  Spent: ${self.total_cost:.4f}")
+            if self.config.budget_limit_usd > 0:
+                remaining = self.config.budget_limit_usd - self.total_cost
+                lines.append(f"  Budget remaining: ${remaining:.4f}")
+
         return "\n".join(lines)
 
     @property
     def cost_report(self) -> str:
-        """Detailed cost report."""
+        """Detailed cost report with per-employee breakdown."""
         lines = ["**Cost Report**\n"]
-        total = 0.0
+        total_cost = 0.0
+        total_duration = 0
+        has_costs = False
+
         for emp in self.employees.values():
-            if emp.cost_total_usd > 0:
-                lines.append(f"  {emp.name} ({emp.role_def.role}): ${emp.cost_total_usd:.4f}")
-                total += emp.cost_total_usd
+            tasks_done = [t for t in emp.task_history if t.status == "done"]
+            emp_duration = sum(t.duration_ms for t in emp.task_history)
+            task_count = len(tasks_done)
+            total_cost += emp.cost_total_usd
+            total_duration += emp_duration
+
+            if emp.cost_total_usd > 0 or task_count > 0:
+                has_costs = True
+                duration_str = format_duration_ms(emp_duration)
+                task_label = "task" if task_count == 1 else "tasks"
+                lines.append(
+                    f"  {emp.name} ({emp.role_def.role}): "
+                    f"${emp.cost_total_usd:.4f} — "
+                    f"{task_count} {task_label}, {duration_str}"
+                )
                 for task in emp.task_history[-5:]:
                     if task.cost_usd > 0:
                         lines.append(f"    - {task.description[:50]}: ${task.cost_usd:.4f}")
-        if total > 0:
-            lines.append(f"\n  **Total: ${total:.4f}**")
+
+        if has_costs:
+            lines.append(
+                f"\n  **Total: ${total_cost:.4f} | {format_duration_ms(total_duration)}**"
+            )
+            if self.config.budget_limit_usd > 0:
+                pct = (total_cost / self.config.budget_limit_usd) * 100
+                lines.append(
+                    f"  Budget: ${self.config.budget_limit_usd:.2f} ({pct:.0f}% used)"
+                )
         else:
             lines.append("  No costs recorded yet.")
+
         return "\n".join(lines)
 
     @property

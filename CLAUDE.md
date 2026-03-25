@@ -1,7 +1,7 @@
 # shipwright
 
-Virtual engineering crews powered by Claude. Hire AI dev teams
-that collaborate conversationally — not fire-and-forget.
+Virtual engineering company powered by Claude. Hire persistent AI employees,
+organize them into teams, and assign work conversationally.
 
 ## Usage
 ```bash
@@ -12,9 +12,8 @@ pip install /path/to/shipwright
 shipwright
 
 # Quick hire
-shipwright hire backend "Add Stripe payments"
-shipwright hire frontend "Redesign the dashboard"
-shipwright hire enterprise "Build complete SaaS billing"
+shipwright hire backend-dev "Add Stripe payments"
+shipwright hire frontend-dev "Redesign the dashboard"
 
 # Status
 shipwright status
@@ -25,21 +24,20 @@ shipwright --discord
 ```
 
 ## Architecture
-Crew-based conversational model:
+Company model — persistent employees organized into optional teams:
 
 ```
 shipwright/
 ├── main.py                  # CLI entry point
 ├── config.py                # Config loading (env + shipwright.yaml + plugins)
 ├── sdk_patch.py             # Monkey-patch SDK for unknown message types
-├── crew/
-│   ├── registry.py          # Built-in crew definitions + custom crew resolution
-│   ├── crew.py              # Crew + EnterpriseCrew orchestration
-│   ├── member.py            # CrewMember — wraps a Claude Code SDK session
-│   └── lead.py              # CrewLead — the conversational coordinator
+├── company/
+│   ├── company.py           # Company — manages employees, teams, work assignment
+│   ├── employee.py          # Employee — wraps a Claude Code SDK session
+│   └── roles.py             # Built-in role definitions + plugin resolution
 ├── conversation/
 │   ├── session.py           # Conversation session — message history, context
-│   └── router.py            # Routes user messages to the right crew
+│   └── router.py            # Routes user messages to the right employee/team
 ├── workspace/
 │   ├── git.py               # Git worktree management
 │   └── project.py           # Project discovery (detect tech stack, structure)
@@ -48,51 +46,67 @@ shipwright/
 │   ├── telegram.py          # Telegram bot (per-chat state)
 │   └── discord.py           # Discord bot (per-channel state)
 ├── persistence/
-│   └── store.py             # Save/restore crews, conversations, state
+│   └── store.py             # Save/restore company state, sessions
 └── utils/
     └── logging.py           # Structured logging
 ```
 
 ## Key design decisions
-- **Crew model**: Users hire domain crews (backend, frontend, qa, etc.) and talk to a crew lead
-- **Conversational**: Crew leads ask clarifying questions, propose approaches, report progress
+- **Company model**: Users hire individual employees with specific roles, optionally organize into teams
+- **Persistent employees**: Employees remember context across tasks via SDK session_id resume
+- **Team delegation**: Team leads coordinate members via delegation blocks (`[DELEGATE:member]...[/DELEGATE]`)
 - **Claude Code SDK**: All agent execution through `claude_code_sdk` — uses local subscription, no API costs
-- **Persistent conversations**: Crews remember context across restarts
-- **Git worktree isolation**: Each crew works on its own branch
+- **Git worktree isolation**: All company work on an isolated branch
 - **Project discovery**: Auto-detects tech stack by scanning the repo
-- **Plugin system**: Custom crews and specialists via `crew.yaml` packages
-- **Enterprise mode**: 3-level hierarchy (Project Lead → Crew Leads → Members) for large cross-domain projects
+- **Plugin system**: Custom roles and specialists via `crew.yaml` packages
+- **Cost tracking**: Per-employee cost/time tracking with optional budget limits (`BUDGET_LIMIT_USD`)
 - **SDK patch**: Monkey-patches `parse_message` to handle unknown types like `rate_limit_event` gracefully
 
-## Built-in crews
-- **fullstack** — Architect, Frontend Dev, Backend Dev, DB Engineer
-- **frontend** — UI Designer, Frontend Dev, CSS Specialist
-- **backend** — API Architect, Backend Dev, DB Engineer
-- **qa** — Test Engineer, Manual Tester, Performance Tester
-- **devops** — Infra Engineer, CI/CD Specialist, Monitoring
-- **security** — Security Auditor, Pen Tester
-- **docs** — Technical Writer, API Docs Specialist
-- **enterprise** — Project Lead → auto-spawned sub-crews (3-level hierarchy)
+## Built-in roles
+Individual roles that can be hired standalone or organized into teams:
+- **architect** — System Architect (read-only, specs)
+- **backend-dev** — Backend Developer
+- **frontend-dev** — Frontend Developer
+- **db-engineer** — Database Engineer
+- **designer** — UI/UX Designer
+- **team-lead** — Team Lead (coordinates via delegation)
+- **test-engineer** — Test Engineer
+- **tech-writer** — Technical Writer
+- Plus crew-specific roles (fullstack, frontend, backend, qa, devops, security, docs)
 
 ## Plugin system
-- Custom crews/specialists in `./shipwright/crews/` or `~/.shipwright/crews/`
+- Custom roles/specialists in `./shipwright/crews/` or `~/.shipwright/crews/`
 - Each plugin is a directory with `crew.yaml` (kind: crew or kind: specialist)
 - Specialists support `references/` directory for bundled docs
 - Resolution order: project-local → user-global → YAML config → built-in
-- Recruit specialists into active crews at runtime
 
 ## CLI commands (REPL)
-- `hire <type> <objective>` — Hire a new crew
-- `fire <crew-id>` — Dismiss a crew
-- `status` / `crews` — Show active crews
-- `talk to <crew-id>` — Switch active crew
-- `ship` / `pr` — Create a PR from active crew's work
-- `shop` — List all available crew types
-- `installed` — List custom crews and specialists
-- `inspect <name>` — Show crew/specialist details
-- `recruit <specialist> into <crew-id>` — Add specialist to crew
-- `log <crew-id>` — View conversation history
+- `hire <role>` / `hire <role> as "Name"` — Hire an employee
+- `fire <name>` — Dismiss an employee or team
+- `team create <name>` — Create a team
+- `promote <name> to lead of <team>` — Make someone team lead
+- `assign <name> to <team>` — Add employee to a team
+- `assign <name|team> "<task>"` — Give work to an employee or team
+- `talk <name>` — Switch active employee
+- `status` — Company overview with cost data
+- `costs` — Detailed cost/budget report per employee
+- `history <name>` — Task history for an employee
+- `ship` / `ship <team>` — Create a PR
+- `save` / `session save <name>` — Save session state
+- `session load <name>` — Load a named session
+- `sessions` — List saved sessions
+- `session clear` — Reset everything
+- `roles` — List available roles
+- `shop` — Browse all roles & specialists
+- `installed` — List custom/installed plugins
+- `inspect <name>` — Show role/specialist details
 - `help` — Show commands
+
+## Environment variables
+- `BUDGET_LIMIT_USD` — Optional spending cap (default: no limit)
+- `SHIPWRIGHT_MODEL` — Model to use (default: `claude-sonnet-4-6`)
+- `SHIPWRIGHT_PERMISSION_MODE` — SDK permission mode (default: `bypassPermissions`)
+- `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` — Bot tokens for chat interfaces
 
 ## Dependencies
 - `claude-code-sdk` — Claude Code SDK for agent execution
