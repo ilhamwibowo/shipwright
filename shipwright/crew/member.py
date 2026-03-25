@@ -15,6 +15,7 @@ from claude_code_sdk import (
     ClaudeCodeOptions,
     ResultMessage,
     TextBlock,
+    ThinkingBlock,
     ToolUseBlock,
     query,
 )
@@ -136,6 +137,9 @@ class CrewMember:
                             collected_text.append(block.text)
                             if on_text:
                                 on_text(block.text)
+                        elif isinstance(block, ThinkingBlock):
+                            # Capture thinking as fallback if no text produced
+                            logger.debug("[%s] Thinking: %s", self.name, block.thinking[:100])
                         elif isinstance(block, ToolUseBlock):
                             logger.debug(
                                 "[%s] Tool use: %s", self.name, block.name

@@ -37,8 +37,10 @@ def _build_lead_system_prompt(crew_def: CrewDef, project_context: str = "") -> s
     member_descriptions = []
     for mname, mdef in crew_def.members.items():
         tools = ", ".join(mdef.tools)
+        # Use only first line of prompt for lead context — full prompt goes to member
+        summary = mdef.prompt.strip().split('\n')[0]
         member_descriptions.append(
-            f"- **{mname}** ({mdef.role}): {mdef.prompt} [Tools: {tools}]"
+            f"- **{mname}** ({mdef.role}): {summary} [Tools: {tools}]"
         )
 
     members_section = "\n".join(member_descriptions) if member_descriptions else "No members defined."
@@ -93,7 +95,9 @@ so you can plan the next step.
 - Ask for feedback before moving to the next phase
 
 ## Important Rules
-- You coordinate — you don't write code yourself. Use [DELEGATE] blocks to assign work.
+- You MUST use [DELEGATE:member_name] blocks to assign work. You cannot do work yourself — you have no write tools.
+- NEVER just talk about delegating. Actually include the [DELEGATE:member_name]...[/DELEGATE] block in your response.
+- If the user asks for code changes, you MUST delegate. Responding without a [DELEGATE] block when work is needed is a failure.
 - Each member has specific tools; respect their capabilities
 - Work happens in isolated git worktrees for safety
 - If something fails, diagnose and retry or escalate to the user
