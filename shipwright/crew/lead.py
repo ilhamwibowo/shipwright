@@ -24,7 +24,7 @@ from claude_code_sdk import (
     ToolUseBlock,
     query,
 )
-from claude_code_sdk._errors import MessageParseError
+import shipwright.sdk_patch  # noqa: ensure patch is applied
 
 from shipwright.config import Config, CrewDef
 from shipwright.utils.logging import get_logger
@@ -206,18 +206,8 @@ class CrewLead:
         response = LeadResponse(text="")
 
         try:
-            stream = query(prompt=prompt, options=options).__aiter__()
-            while True:
-                try:
-                    message = await stream.__anext__()
-                except StopAsyncIteration:
-                    break
-                except MessageParseError as exc:
-                    logger.debug("[lead/%s] Skipping parse error: %s", self.crew_def.name, exc)
-                    continue
-                except Exception as iter_exc:
-                    # Some SDK errors are non-fatal, log and continue
-                    logger.debug("[lead/%s] Skipping iteration error: %s", self.crew_def.name, iter_exc)
+            async for message in query(prompt=prompt, options=options):
+                if message is None:
                     continue
 
                 if isinstance(message, AssistantMessage):

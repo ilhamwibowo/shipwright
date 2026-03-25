@@ -19,7 +19,7 @@ from claude_code_sdk import (
     ToolUseBlock,
     query,
 )
-from claude_code_sdk._errors import MessageParseError
+import shipwright.sdk_patch  # noqa: ensure patch is applied
 
 from shipwright.config import MemberDef
 from shipwright.utils.logging import get_logger
@@ -118,17 +118,8 @@ class CrewMember:
         result = MemberResult(output="")
 
         try:
-            stream = query(prompt=prompt, options=options).__aiter__()
-            while True:
-                try:
-                    message = await stream.__anext__()
-                except StopAsyncIteration:
-                    break
-                except MessageParseError as exc:
-                    logger.debug("[%s] Skipping parse error: %s", self.name, exc)
-                    continue
-                except Exception as iter_exc:
-                    logger.debug("[%s] Skipping iteration error: %s", self.name, iter_exc)
+            async for message in query(prompt=prompt, options=options):
+                if message is None:
                     continue
 
                 if isinstance(message, AssistantMessage):
@@ -138,12 +129,9 @@ class CrewMember:
                             if on_text:
                                 on_text(block.text)
                         elif isinstance(block, ThinkingBlock):
-                            # Capture thinking as fallback if no text produced
                             logger.debug("[%s] Thinking: %s", self.name, block.thinking[:100])
                         elif isinstance(block, ToolUseBlock):
-                            logger.debug(
-                                "[%s] Tool use: %s", self.name, block.name
-                            )
+                            logger.debug("[%s] Tool use: %s", self.name, block.name)
                             if on_tool_use:
                                 on_tool_use(block.name, getattr(block, "input", {}))
 
