@@ -536,3 +536,209 @@ class TestDelegationLoop:
             result = await crew.chat("Build it")
 
         assert "different approach" in result
+
+    @pytest.mark.asyncio
+    async def test_delegation_callbacks_fired(self, crew_with_members):
+        """on_delegation_start and on_delegation_end are called correctly."""
+        crew = crew_with_members
+
+        lead_resp_1 = LeadResponse(
+            text="Delegating.\n\n[DELEGATE:architect]\nAnalyze.\n[/DELEGATE]"
+        )
+        lead_resp_2 = LeadResponse(text="Done.")
+
+        call_count = 0
+
+        async def mock_respond(user_message, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return lead_resp_1
+            return lead_resp_2
+
+        member_result = MemberResult(output="Analysis complete.")
+
+        start_calls = []
+        end_calls = []
+
+        def on_start(name, task, round_num, max_rounds):
+            start_calls.append((name, task, round_num, max_rounds))
+
+        def on_end(name, duration, is_error):
+            end_calls.append((name, duration, is_error))
+
+        with (
+            patch.object(crew.lead, "respond", side_effect=mock_respond),
+            patch.object(crew, "delegate", new_callable=AsyncMock, return_value=member_result),
+        ):
+            await crew.chat(
+                "Analyze",
+                on_delegation_start=on_start,
+                on_delegation_end=on_end,
+            )
+
+        assert len(start_calls) == 1
+        assert start_calls[0][0] == "architect"
+        assert start_calls[0][2] == 1  # round_num
+        assert start_calls[0][3] == crew.max_delegation_rounds
+
+        assert len(end_calls) == 1
+        assert end_calls[0][0] == "architect"
+        assert end_calls[0][2] is False  # not an error
+
+    @pytest.mark.asyncio
+    async def test_delegation_end_reports_error(self, crew_with_members):
+        """on_delegation_end reports is_error=True for failed members."""
+        crew = crew_with_members
+
+        lead_resp_1 = LeadResponse(
+            text="Delegating.\n\n[DELEGATE:developer]\nBuild.\n[/DELEGATE]"
+        )
+        lead_resp_2 = LeadResponse(text="Failed.")
+
+        call_count = 0
+
+        async def mock_respond(user_message, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return lead_resp_1
+            return lead_resp_2
+
+        failed_result = MemberResult(output="Error", is_error=True)
+        end_calls = []
+
+        with (
+            patch.object(crew.lead, "respond", side_effect=mock_respond),
+            patch.object(crew, "delegate", new_callable=AsyncMock, return_value=failed_result),
+        ):
+            await crew.chat(
+                "Build",
+                on_delegation_end=lambda name, dt, err: end_calls.append((name, err)),
+            )
+
+        assert len(end_calls) == 1
+        assert end_calls[0][1] is True
+
+    @pytest.mark.asyncio
+    async def test_on_progress_callback(self, crew_with_members):
+        """on_progress is called with 'Reviewing results...' after delegation."""
+        crew = crew_with_members
+
+        lead_resp_1 = LeadResponse(
+            text="Delegating.\n\n[DELEGATE:architect]\nAnalyze.\n[/DELEGATE]"
+        )
+        lead_resp_2 = LeadResponse(text="Done.")
+
+        call_count = 0
+
+        async def mock_respond(user_message, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return lead_resp_1
+            return lead_resp_2
+
+        member_result = MemberResult(output="Analysis complete.")
+        progress_calls = []
+
+        with (
+            patch.object(crew.lead, "respond", side_effect=mock_respond),
+            patch.object(crew, "delegate", new_callable=AsyncMock, return_value=member_result),
+        ):
+            await crew.chat(
+                "Analyze",
+                on_progress=lambda msg: progress_calls.append(msg),
+            )
+
+        assert len(progress_calls) >= 1
+        assert "Reviewing results..." in progress_calls
+
+    @pytest.mark.asyncio
+    async def test_parallel_delegation_callbacks(self, crew_with_members):
+        """Callbacks fire for each member in parallel delegation."""
+        crew = crew_with_members
+
+        lead_resp_1 = LeadResponse(
+            text=(
+                "Parallel.\n\n"
+                "[DELEGATE:developer]\nBuild API.\n[/DELEGATE]\n"
+                "[DELEGATE:db_engineer]\nCreate schema.\n[/DELEGATE]"
+            )
+        )
+        lead_resp_2 = LeadResponse(text="Both done.")
+
+        call_count = 0
+
+        async def mock_respond(user_message, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return lead_resp_1
+            return lead_resp_2
+
+        parallel_results = {
+            "developer": MemberResult(output="API built."),
+            "db_engineer": MemberResult(output="Schema created."),
+        }
+
+        start_names = []
+        end_names = []
+
+        with (
+            patch.object(crew.lead, "respond", side_effect=mock_respond),
+            patch.object(
+                crew, "delegate_parallel",
+                new_callable=AsyncMock,
+                return_value=parallel_results,
+            ),
+        ):
+            await crew.chat(
+                "Build",
+                on_delegation_start=lambda n, t, r, m: start_names.append(n),
+                on_delegation_end=lambda n, d, e: end_names.append(n),
+            )
+
+        assert set(start_names) == {"developer", "db_engineer"}
+        assert set(end_names) == {"developer", "db_engineer"}
+
+
+# ---------------------------------------------------------------------------
+# _last_task_duration
+# ---------------------------------------------------------------------------
+
+class TestLastTaskDuration:
+    def test_returns_duration(self):
+        crew_def = get_crew_def("backend")
+        config = Config()
+        crew = Crew.create("backend", crew_def, config, objective="Test")
+        crew.task_records.append(
+            TaskRecord(
+                member_name="developer",
+                task="Build API",
+                status="done",
+                started_at=100.0,
+                finished_at=112.5,
+            )
+        )
+        assert crew._last_task_duration("developer") == 12.5
+
+    def test_returns_zero_when_no_records(self):
+        crew_def = get_crew_def("backend")
+        config = Config()
+        crew = Crew.create("backend", crew_def, config, objective="Test")
+        assert crew._last_task_duration("developer") == 0.0
+
+    def test_returns_most_recent(self):
+        crew_def = get_crew_def("backend")
+        config = Config()
+        crew = Crew.create("backend", crew_def, config, objective="Test")
+        crew.task_records.append(
+            TaskRecord(member_name="dev", task="t1", status="done",
+                       started_at=100.0, finished_at=105.0)
+        )
+        crew.task_records.append(
+            TaskRecord(member_name="dev", task="t2", status="done",
+                       started_at=200.0, finished_at=220.0)
+        )
+        assert crew._last_task_duration("dev") == 20.0

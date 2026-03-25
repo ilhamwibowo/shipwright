@@ -219,7 +219,9 @@ class CrewLead:
                 elif isinstance(message, ResultMessage):
                     response.session_id = getattr(message, "session_id", "")
                     self._session_id = response.session_id or self._session_id
-                    if getattr(message, "result", None):
+                    # Only use ResultMessage.result as fallback — TextBlocks
+                    # already captured the same text during streaming.
+                    if not collected_text and getattr(message, "result", None):
                         collected_text.append(message.result)
 
         except Exception as exc:

@@ -89,11 +89,19 @@ def cleanup_worktree(repo: str | Path, path: str | Path, branch: str) -> None:
     logger.info("Cleaned up worktree %s", path)
 
 
-def commit(path: str | Path, msg: str) -> None:
-    """Stage all changes and commit if there are any."""
+def commit(path: str | Path, msg: str, no_verify: bool = False) -> None:
+    """Stage all changes and commit if there are any.
+
+    Args:
+        no_verify: Skip pre-commit hooks (useful for worktree commits where
+            the parent repo's hooks may not apply).
+    """
     _git(["add", "-A"], path)
     if _git(["status", "--porcelain"], path):
-        _git(["commit", "-m", msg], path)
+        cmd = ["commit", "-m", msg]
+        if no_verify:
+            cmd.append("--no-verify")
+        _git(cmd, path)
 
 
 def push_branch(path: str | Path, branch: str) -> None:

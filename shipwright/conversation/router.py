@@ -53,6 +53,9 @@ class Router:
         self,
         text: str,
         on_text: Callable[[str], None] | None = None,
+        on_delegation_start: Callable[[str, str, int, int], None] | None = None,
+        on_delegation_end: Callable[[str, float, bool], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
     ) -> str:
         """Process a user message and return the response.
 
@@ -80,7 +83,13 @@ class Router:
             return response
 
         # Chat with the active crew
-        response = await crew.chat(user_message=text, on_text=on_text)
+        response = await crew.chat(
+            user_message=text,
+            on_text=on_text,
+            on_delegation_start=on_delegation_start,
+            on_delegation_end=on_delegation_end,
+            on_progress=on_progress,
+        )
         self.session.add_lead_message(response, crew_id=crew.id)
         return response
 

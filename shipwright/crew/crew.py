@@ -153,6 +153,9 @@ class Crew:
         self,
         user_message: str,
         on_text: Callable[[str], None] | None = None,
+        on_delegation_start: Callable[[str, str, int, int], None] | None = None,
+        on_delegation_end: Callable[[str, float, bool], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
     ) -> str:
         """Send a message to the crew lead and get a response.
 
@@ -162,9 +165,18 @@ class Crew:
         3. Feed results back to the lead
         4. Repeat until the lead responds without delegations or max rounds hit
 
+        Args:
+            on_text: Callback for streaming lead text as it arrives.
+            on_delegation_start: Called when a member starts work.
+                Args: (member_name, task, round_num, max_rounds).
+            on_delegation_end: Called when a member finishes.
+                Args: (member_name, duration_seconds, is_error).
+            on_progress: Callback for status updates (e.g. 'Reviewing results...').
+
         Returns the lead's final response text.
         """
         self._ensure_members()
+        chat_start = time.time()
         status_ctx = self._build_status_context()
         collected_responses: list[str] = []
 
@@ -193,9 +205,17 @@ class Crew:
             # Execute delegations (parallel if multiple, sequential if single)
             if len(delegations) == 1:
                 d = delegations[0]
-                result = await self._execute_delegation(d, delegation_context, on_text)
+                if on_delegation_start:
+                    on_delegation_start(d.member_name, d.task, round_num, self.max_delegation_rounds)
+                result = await self._execute_delegation(d, delegation_context)
+                dt = self._last_task_duration(d.member_name)
+                if on_delegation_end:
+                    on_delegation_end(d.member_name, dt, result.is_error)
                 results_summary = self._format_member_result(d.member_name, result)
             else:
+                for d in delegations:
+                    if on_delegation_start:
+                        on_delegation_start(d.member_name, d.task, round_num, self.max_delegation_rounds)
                 tasks = [
                     (d.member_name, d.task, delegation_context)
                     for d in delegations
@@ -205,10 +225,16 @@ class Crew:
                 for d in delegations:
                     r = parallel_results.get(d.member_name)
                     if r:
+                        dt = self._last_task_duration(d.member_name)
+                        if on_delegation_end:
+                            on_delegation_end(d.member_name, dt, r.is_error)
                         parts.append(self._format_member_result(d.member_name, r))
                 results_summary = "\n\n".join(parts)
 
             # Feed results back to the lead
+            if on_progress:
+                on_progress("Reviewing results...")
+
             followup = (
                 f"Here are the results from the team:\n\n{results_summary}\n\n"
                 "Review the results. If more work is needed, delegate again. "
@@ -234,20 +260,21 @@ class Crew:
                 "(Reached maximum delegation rounds. Some work may still be pending.)"
             )
 
+        total_time = time.time() - chat_start
+        logger.info("[%s] Chat completed in %.1fs", self.id, total_time)
+
         return "\n\n".join(collected_responses)
 
     async def _execute_delegation(
         self,
         delegation: DelegationRequest,
         context: str,
-        on_text: Callable[[str], None] | None = None,
     ) -> MemberResult:
         """Execute a single delegation request."""
         return await self.delegate(
             member_name=delegation.member_name,
             task=delegation.task,
             context=context,
-            on_text=on_text,
         )
 
     def _build_delegation_context(self) -> str:
@@ -265,6 +292,13 @@ class Crew:
                     output += "\n... (truncated)"
                 parts.append(output)
         return "\n\n".join(parts) if len(parts) > 1 else ""
+
+    def _last_task_duration(self, member_name: str) -> float:
+        """Get duration of the most recent completed task for a member."""
+        for rec in reversed(self.task_records):
+            if rec.member_name == member_name and rec.started_at and rec.finished_at:
+                return rec.finished_at - rec.started_at
+        return 0.0
 
     @staticmethod
     def _format_member_result(member_name: str, result: MemberResult) -> str:
@@ -321,7 +355,7 @@ class Crew:
                     t in member.allowed_tools for t in ("Edit", "Write")
                 ):
                     try:
-                        commit(self.worktree_path, f"{member.role}: {task[:50]}")
+                        commit(self.worktree_path, f"{member.role}: {task[:50]}", no_verify=True)
                     except Exception as e:
                         logger.warning("Auto-commit failed: %s", e)
 
@@ -374,7 +408,7 @@ class Crew:
             logger.warning("No worktree to ship from")
             return None
 
-        commit(self.worktree_path, f"shipwright: {self.objective[:60]}")
+        commit(self.worktree_path, f"shipwright: {self.objective[:60]}", no_verify=True)
 
         pr_title = title or (
             self.objective[:70] if len(self.objective) <= 70

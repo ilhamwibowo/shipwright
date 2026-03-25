@@ -142,7 +142,9 @@ class CrewMember:
                     result.is_error = getattr(message, "is_error", False)
                     result.total_cost_usd = getattr(message, "total_cost_usd", 0.0) or 0.0
                     self._session_id = result.session_id or self._session_id
-                    if getattr(message, "result", None):
+                    # Only use ResultMessage.result as fallback — TextBlocks
+                    # already captured the same text during streaming.
+                    if not collected_text and getattr(message, "result", None):
                         collected_text.append(message.result)
 
         except Exception as exc:
