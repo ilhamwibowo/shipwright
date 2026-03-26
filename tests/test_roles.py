@@ -34,7 +34,6 @@ class TestBuiltinRoles:
         "tech-writer",
         "designer",
         "team-lead",
-        "vp-engineering",
     }
 
     def test_all_roles_exist(self):

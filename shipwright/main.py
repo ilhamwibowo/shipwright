@@ -196,7 +196,7 @@ REPL commands:
 
 Available roles: architect, backend-dev, frontend-dev, fullstack-dev,
   db-engineer, qa-engineer, devops-engineer, security-auditor,
-  tech-writer, designer, team-lead, vp-engineering
+  tech-writer, designer, team-lead
 
 Examples:
   shipwright hire backend-dev

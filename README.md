@@ -65,7 +65,7 @@ shipwright > roles
   Available roles:
     architect, backend-dev, frontend-dev, fullstack-dev, db-engineer,
     qa-engineer, devops-engineer, security-auditor, tech-writer, designer,
-    team-lead, vp-engineering
+    team-lead
 
 shipwright > hire backend-dev
   Hired Alex as Backend Developer (idle)
@@ -139,7 +139,6 @@ When work is assigned to a team, the lead breaks it into sub-tasks, delegates to
 | **tech-writer** | Documentation, API docs | Documentation |
 | **designer** | UI/UX design, component design | Design |
 | **team-lead** | Coordinates a group of employees | Team management |
-| **vp-engineering** | Coordinates team leads | Large projects |
 
 Each role has a rich, senior-level system prompt with engineering philosophy, patterns, anti-patterns, and standards.
 
