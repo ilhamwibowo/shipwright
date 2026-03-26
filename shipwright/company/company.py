@@ -28,9 +28,14 @@ from shipwright.company.employee import (
     HireRequest,
     LeadResponse,
     ReviseRequest,
+    Roadmap,
+    RoadmapTask,
+    RoadmapTaskStatus,
     parse_delegations,
     parse_hire_blocks,
     parse_revise_blocks,
+    parse_roadmap_block,
+    parse_execute_roadmap,
     next_name,
 )
 from shipwright.utils.logging import get_logger
@@ -110,6 +115,7 @@ class Company:
     project_context: str = ""
     worktree_path: Path | None = None
     branch: str | None = None
+    active_roadmap: Roadmap | None = None
     _active_employee: str | None = field(default=None, repr=False)
     _stale_worktree: str | None = field(default=None, repr=False)
 
@@ -456,6 +462,7 @@ class Company:
 
         The CTO processes the user's message, optionally hires employees,
         delegates work, reviews results, and presents to the user.
+        If the CTO outputs a [ROADMAP] block, it's stored for user approval.
         """
         cto = self.get_cto()
         if not cto:
@@ -483,7 +490,39 @@ class Company:
         cto._conversation.append({"role": "user", "text": message})
         cto._conversation.append({"role": "cto", "text": response_text})
 
-        # Step 2: Parse and filter blocks (hierarchy enforcement)
+        # Step 2a: Check for roadmap block
+        response_text, roadmap = parse_roadmap_block(response_text)
+        if roadmap:
+            roadmap.original_request = message
+            self.active_roadmap = roadmap
+            # Return CTO's commentary + the roadmap for user approval
+            parts = []
+            if response_text:
+                parts.append(response_text)
+            parts.append(roadmap.status_display())
+            parts.append(
+                "\nType **go** or **approve** to start autonomous execution, "
+                "or modify the plan first."
+            )
+            return "\n\n".join(parts)
+
+        # Step 2b: Check for [EXECUTE_ROADMAP] signal
+        response_text, should_execute = parse_execute_roadmap(response_text)
+        if should_execute and self.active_roadmap and self.active_roadmap.approved:
+            # CTO is signalling to continue roadmap execution
+            exec_result = await self.execute_roadmap(
+                on_text=on_text,
+                on_delegation_start=on_delegation_start,
+                on_delegation_end=on_delegation_end,
+                on_progress=on_progress,
+            )
+            parts = []
+            if response_text:
+                parts.append(response_text)
+            parts.append(exec_result)
+            return "\n\n".join(filter(None, parts))
+
+        # Step 3: Parse and filter blocks (hierarchy enforcement)
         response_text, hires = parse_hire_blocks(response_text)
         hires = self._filter_hires(cto, hires)
         hire_messages = self._process_hires(hires)
@@ -500,7 +539,7 @@ class Company:
                 parts.append("\n".join(hire_messages))
             return "\n\n".join(parts) if parts else response_text
 
-        # Step 3: Delegation loop (shared with team-leads)
+        # Step 4: Delegation loop (shared with team-leads)
         loop_result = await self._delegation_loop(
             coordinator=cto,
             delegations=delegations,
@@ -520,6 +559,179 @@ class Company:
         if loop_result:
             parts.append(loop_result)
         return "\n\n".join(filter(None, parts))
+
+    async def execute_roadmap(
+        self,
+        on_text: Callable[[str], None] | None = None,
+        on_delegation_start: Callable[[str, str, int, int], None] | None = None,
+        on_delegation_end: Callable[[str, float, bool], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+        on_roadmap_task_complete: Callable[[int, int, str], None] | None = None,
+    ) -> str:
+        """Execute the active roadmap task by task.
+
+        For each task:
+        1. Provide accumulated context + roadmap progress to the CTO
+        2. CTO delegates the task via the normal hire/delegate/review flow
+        3. After completion, context-reset the CTO and capture the handoff
+        4. Record progress, report to user, move to next task
+
+        Returns a summary of all completed work.
+        Pauses on failure or if interrupted (sets roadmap.paused = True).
+        """
+        roadmap = self.active_roadmap
+        if not roadmap:
+            return "No active roadmap."
+        if not roadmap.approved:
+            return "Roadmap not yet approved. Type **go** to start."
+
+        cto = self.get_cto()
+        if not cto:
+            return "No CTO available."
+
+        roadmap.paused = False
+        collected_reports: list[str] = []
+
+        while True:
+            idx = roadmap.current_task_index
+            if idx is None:
+                break  # All tasks done
+
+            task = roadmap.tasks[idx - 1]  # convert 1-based to 0-based
+            task.status = RoadmapTaskStatus.RUNNING
+
+            if on_progress:
+                on_progress(
+                    f"Roadmap task {idx}/{roadmap.total_count}: {task.description}"
+                )
+
+            # Build context for this task
+            context_parts = [
+                f"# Roadmap Execution — Task {idx}/{roadmap.total_count}",
+                f"## Original Request\n{roadmap.original_request}",
+                f"## Current Task\n{task.description}",
+            ]
+            accumulated = roadmap.accumulated_context
+            if accumulated:
+                context_parts.append(
+                    f"## Completed Tasks Context\n{accumulated}"
+                )
+            context_parts.append(
+                "## Instructions\n"
+                "Execute this specific task. Hire engineers if needed, "
+                "delegate the work, review the results. Focus only on this task."
+            )
+            task_prompt = "\n\n".join(context_parts)
+
+            # Budget check
+            budget = self.config.budget_limit_usd
+            if budget > 0 and self.total_cost >= budget:
+                task.status = RoadmapTaskStatus.FAILED
+                task.output_summary = "Budget exceeded"
+                roadmap.paused = True
+                collected_reports.append(
+                    f"Task {idx}/{roadmap.total_count} **paused**: Budget exceeded."
+                )
+                break
+
+            # Execute via the normal CTO flow (without recursing into roadmap)
+            try:
+                system_prompt = self._build_cto_prompt()
+                result = await cto.run(
+                    task=task_prompt,
+                    system_prompt=system_prompt,
+                    on_text=on_text,
+                )
+                response_text = result.output
+
+                cto._conversation.append({"role": "system", "text": task_prompt})
+                cto._conversation.append({"role": "cto", "text": response_text})
+
+                # Process hires and delegations from CTO response
+                response_text, hires = parse_hire_blocks(response_text)
+                hires = self._filter_hires(cto, hires)
+                self._process_hires(hires)
+
+                response_text, delegations = parse_delegations(response_text)
+                delegations = self._filter_delegations(cto, delegations)
+
+                if delegations:
+                    loop_result = await self._delegation_loop(
+                        coordinator=cto,
+                        delegations=delegations,
+                        coordinator_text=response_text,
+                        on_text=None,  # suppress streaming during auto-exec
+                        on_delegation_start=on_delegation_start,
+                        on_delegation_end=on_delegation_end,
+                        on_progress=on_progress,
+                    )
+                    response_text = (
+                        f"{response_text}\n\n{loop_result}" if loop_result else response_text
+                    )
+
+                # Task completed
+                task.status = RoadmapTaskStatus.DONE
+                # Build summary from first 200 chars of response
+                summary_line = response_text.strip().split("\n")[0][:200] if response_text else "Done"
+                task.output_summary = summary_line
+
+                # Context reset the CTO to stay fresh
+                artifact_path = cto.save_handoff_artifact(
+                    task_description=task.description,
+                )
+                if artifact_path and artifact_path.exists():
+                    task.handoff_artifact = artifact_path.read_text()[:3000]
+                cto._session_id = None
+                cto._conversation.clear()
+                cto._cumulative_turns = 0
+
+                report = (
+                    f"Task {idx}/{roadmap.total_count} done: "
+                    f"{task.description}"
+                )
+                collected_reports.append(report)
+
+                if on_roadmap_task_complete:
+                    on_roadmap_task_complete(idx, roadmap.total_count, task.description)
+
+                if on_progress:
+                    remaining = roadmap.total_count - roadmap.done_count
+                    if remaining > 0:
+                        on_progress(
+                            f"{report}. {remaining} task(s) remaining."
+                        )
+
+            except asyncio.CancelledError:
+                # Ctrl+C / cancellation — pause gracefully
+                task.status = RoadmapTaskStatus.PENDING
+                roadmap.paused = True
+                collected_reports.append(
+                    f"Task {idx}/{roadmap.total_count} **paused**: Interrupted. "
+                    "Type `continue` to resume."
+                )
+                break
+
+            except Exception as exc:
+                logger.error("Roadmap task %d failed: %s", idx, exc)
+                task.status = RoadmapTaskStatus.FAILED
+                task.output_summary = f"Error: {exc}"
+                roadmap.paused = True
+                collected_reports.append(
+                    f"Task {idx}/{roadmap.total_count} **failed**: {exc}\n"
+                    "Roadmap paused. Fix the issue and type `continue` to retry, "
+                    "or modify the roadmap."
+                )
+                break
+
+        # Final summary
+        if roadmap.is_complete:
+            collected_reports.append(
+                f"\n**Roadmap complete!** All {roadmap.total_count} tasks done."
+            )
+            # Clear the roadmap
+            self.active_roadmap = None
+
+        return "\n".join(collected_reports)
 
     def _process_hires(self, hires: list[HireRequest]) -> list[str]:
         """Process [HIRE] requests from CTO. Returns status messages."""
@@ -1091,13 +1303,16 @@ class Company:
         elif self._stale_worktree:
             wt_str = self._stale_worktree
 
-        return {
+        result = {
             "employees": {name: emp.to_dict() for name, emp in self.employees.items()},
             "teams": {name: team.to_dict() for name, team in self.teams.items()},
             "active_employee": self._active_employee,
             "worktree_path": wt_str,
             "branch": self.branch,
         }
+        if self.active_roadmap:
+            result["active_roadmap"] = self.active_roadmap.to_dict()
+        return result
 
     @classmethod
     def from_dict(cls, data: dict, config: Config) -> "Company":
@@ -1133,5 +1348,10 @@ class Company:
         # Restore teams
         for name, team_data in data.get("teams", {}).items():
             company.teams[name] = Team.from_dict(team_data)
+
+        # Restore active roadmap
+        roadmap_data = data.get("active_roadmap")
+        if roadmap_data:
+            company.active_roadmap = Roadmap.from_dict(roadmap_data)
 
         return company

@@ -195,7 +195,32 @@ class Router:
                 self.session.add_system_message(response)
                 return response
 
-        # ---- 2. Async: ship / pr -------------------------------------------
+        # ---- 2a. Async: roadmap approval / resume ----------------------------
+        if lower in ("go", "approve", "ship it", "lgtm"):
+            response = await self._roadmap_approve(
+                on_text=on_text,
+                on_delegation_start=on_delegation_start,
+                on_delegation_end=on_delegation_end,
+                on_progress=on_progress,
+            )
+            if response:
+                self.session.add_system_message(response)
+                return response
+            # No roadmap to approve — fall through to conversational
+
+        if lower in ("continue", "resume"):
+            response = await self._roadmap_resume(
+                on_text=on_text,
+                on_delegation_start=on_delegation_start,
+                on_delegation_end=on_delegation_end,
+                on_progress=on_progress,
+            )
+            if response:
+                self.session.add_system_message(response)
+                return response
+            # No roadmap to resume — fall through to conversational
+
+        # ---- 2b. Async: ship / pr ------------------------------------------
         if lower.startswith("ship") or lower in ("pr", "open pr", "create pr"):
             parts = text.split(maxsplit=1)
             target = (
@@ -262,6 +287,10 @@ class Router:
 
     def _try_sync_command(self, text: str, lower: str) -> tuple[bool, str]:
         """Try synchronous commands. Returns (is_command, response)."""
+
+        # roadmap — show current roadmap status
+        if lower in ("roadmap", "roadmap status", "plan"):
+            return True, self._roadmap_status()
 
         # back — return to CTO
         if lower == "back":
@@ -630,6 +659,9 @@ class Router:
             "  `back` — Return to CTO conversation\n"
             "  `talk <name>` — Switch active employee\n"
             "  `status` — Company overview\n"
+            "  `roadmap` — Show current roadmap status\n"
+            "  `go` / `approve` — Approve and start roadmap execution\n"
+            "  `continue` / `resume` — Resume a paused roadmap\n"
             "  `costs` — Budget/token usage per employee\n"
             "  `history <name>` — Task history for an employee\n\n"
             "  **Power user commands (bypass CTO):**\n"
@@ -689,6 +721,68 @@ class Router:
 
     def _inspect(self, name: str) -> str:
         return inspect_role(name, self.config)
+
+    # ------------------------------------------------------------------
+    # Roadmap commands
+    # ------------------------------------------------------------------
+
+    def _roadmap_status(self) -> str:
+        """Show the current roadmap status."""
+        roadmap = self.company.active_roadmap
+        if not roadmap:
+            return "No active roadmap."
+        return roadmap.status_display()
+
+    async def _roadmap_approve(
+        self,
+        on_text: Callable[[str], None] | None = None,
+        on_delegation_start: Callable[[str, str, int, int], None] | None = None,
+        on_delegation_end: Callable[[str, float, bool], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> str | None:
+        """Approve and start executing the active roadmap. Returns None if no roadmap."""
+        roadmap = self.company.active_roadmap
+        if not roadmap:
+            return None
+        if roadmap.approved and not roadmap.paused:
+            return "Roadmap is already running."
+        roadmap.approved = True
+        roadmap.paused = False
+        result = await self.company.execute_roadmap(
+            on_text=on_text,
+            on_delegation_start=on_delegation_start,
+            on_delegation_end=on_delegation_end,
+            on_progress=on_progress,
+        )
+        return result
+
+    async def _roadmap_resume(
+        self,
+        on_text: Callable[[str], None] | None = None,
+        on_delegation_start: Callable[[str, str, int, int], None] | None = None,
+        on_delegation_end: Callable[[str, float, bool], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> str | None:
+        """Resume a paused roadmap. Returns None if no roadmap to resume."""
+        roadmap = self.company.active_roadmap
+        if not roadmap:
+            return None
+        if not roadmap.paused:
+            return None  # Not paused, fall through
+        # Reset any failed task to pending so it can be retried
+        for t in roadmap.tasks:
+            if t.status.value == "failed":
+                from shipwright.company.employee import RoadmapTaskStatus
+                t.status = RoadmapTaskStatus.PENDING
+                break
+        roadmap.paused = False
+        result = await self.company.execute_roadmap(
+            on_text=on_text,
+            on_delegation_start=on_delegation_start,
+            on_delegation_end=on_delegation_end,
+            on_progress=on_progress,
+        )
+        return result
 
     def _suggest_hire(self, text: str) -> str:
         roles = list_roles(self.config)

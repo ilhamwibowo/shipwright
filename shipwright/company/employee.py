@@ -35,6 +35,120 @@ from shipwright.utils.logging import get_logger
 logger = get_logger("company.employee")
 
 
+# ---------------------------------------------------------------------------
+# Roadmap — multi-task autonomous execution plan
+# ---------------------------------------------------------------------------
+
+class RoadmapTaskStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+
+
+@dataclass
+class RoadmapTask:
+    """A single task within a roadmap."""
+    index: int  # 1-based position
+    description: str
+    status: RoadmapTaskStatus = RoadmapTaskStatus.PENDING
+    output_summary: str = ""
+    handoff_artifact: str = ""  # path or content from handoff
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "description": self.description,
+            "status": self.status.value,
+            "output_summary": self.output_summary[:2000],
+            "handoff_artifact": self.handoff_artifact[:3000],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "RoadmapTask":
+        return cls(
+            index=data["index"],
+            description=data["description"],
+            status=RoadmapTaskStatus(data.get("status", "pending")),
+            output_summary=data.get("output_summary", ""),
+            handoff_artifact=data.get("handoff_artifact", ""),
+        )
+
+
+@dataclass
+class Roadmap:
+    """A multi-task execution plan created by the CTO for large projects."""
+    tasks: list[RoadmapTask] = field(default_factory=list)
+    original_request: str = ""
+    approved: bool = False
+    paused: bool = False  # True when interrupted (Ctrl+C, failure)
+
+    @property
+    def current_task_index(self) -> int | None:
+        """Return the 1-based index of the next pending/running task, or None if all done."""
+        for t in self.tasks:
+            if t.status in (RoadmapTaskStatus.PENDING, RoadmapTaskStatus.RUNNING):
+                return t.index
+        return None
+
+    @property
+    def done_count(self) -> int:
+        return sum(1 for t in self.tasks if t.status == RoadmapTaskStatus.DONE)
+
+    @property
+    def total_count(self) -> int:
+        return len(self.tasks)
+
+    @property
+    def is_complete(self) -> bool:
+        return all(t.status == RoadmapTaskStatus.DONE for t in self.tasks)
+
+    @property
+    def accumulated_context(self) -> str:
+        """Build context from all completed tasks' handoff artifacts."""
+        parts = []
+        for t in self.tasks:
+            if t.status == RoadmapTaskStatus.DONE and t.handoff_artifact:
+                parts.append(
+                    f"## Task {t.index}: {t.description}\n{t.handoff_artifact}"
+                )
+        return "\n\n".join(parts)
+
+    def status_display(self) -> str:
+        """Human-readable roadmap status."""
+        lines = [f"**Roadmap** ({self.done_count}/{self.total_count} tasks done)\n"]
+        for t in self.tasks:
+            icon = {
+                "pending": "[ ]",
+                "running": "[~]",
+                "done": "[x]",
+                "failed": "[!]",
+            }[t.status.value]
+            lines.append(f"  {icon} {t.index}. {t.description}")
+            if t.output_summary:
+                lines.append(f"       {t.output_summary[:80]}")
+        if self.paused:
+            lines.append("\n  *Paused* — type `go` or `continue` to resume.")
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict:
+        return {
+            "tasks": [t.to_dict() for t in self.tasks],
+            "original_request": self.original_request,
+            "approved": self.approved,
+            "paused": self.paused,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Roadmap":
+        return cls(
+            tasks=[RoadmapTask.from_dict(t) for t in data.get("tasks", [])],
+            original_request=data.get("original_request", ""),
+            approved=data.get("approved", False),
+            paused=data.get("paused", False),
+        )
+
+
 # Name pool for auto-generating employee names
 NAME_POOL = [
     "Alex", "Blake", "Casey", "Drew", "Ellis", "Finley", "Gray", "Harper",
@@ -186,6 +300,62 @@ def parse_revise_blocks(text: str) -> tuple[str, list[ReviseRequest]]:
             revisions.append(ReviseRequest(employee_name=name, feedback=feedback))
     clean_text = _REVISE_PATTERN.sub("", text).strip()
     return clean_text, revisions
+
+
+# ---------------------------------------------------------------------------
+# Roadmap block parsing — [ROADMAP] and [EXECUTE_ROADMAP]
+# ---------------------------------------------------------------------------
+
+_ROADMAP_PATTERN = re.compile(
+    r"\[ROADMAP\]\s*\n(.*?)\[/ROADMAP\]",
+    re.DOTALL,
+)
+
+_EXECUTE_ROADMAP_PATTERN = re.compile(
+    r"\[EXECUTE_ROADMAP\]",
+)
+
+
+def parse_roadmap_block(text: str) -> tuple[str, Roadmap | None]:
+    """Parse a [ROADMAP]...[/ROADMAP] block from CTO response.
+    Returns (clean_text with block removed, Roadmap or None).
+    """
+    match = _ROADMAP_PATTERN.search(text)
+    if not match:
+        return text, None
+
+    raw = match.group(1).strip()
+    tasks: list[RoadmapTask] = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Match lines like "1. Do something" or "- Do something"
+        m = re.match(r'^(?:(\d+)[.)]\s*|-\s*)(.*)', line)
+        if m:
+            idx = int(m.group(1)) if m.group(1) else len(tasks) + 1
+            desc = m.group(2).strip()
+            if desc:
+                tasks.append(RoadmapTask(index=idx, description=desc))
+
+    if not tasks:
+        return text, None
+
+    # Re-index to ensure sequential 1-based
+    for i, t in enumerate(tasks):
+        t.index = i + 1
+
+    clean = _ROADMAP_PATTERN.sub("", text).strip()
+    return clean, Roadmap(tasks=tasks)
+
+
+def parse_execute_roadmap(text: str) -> tuple[str, bool]:
+    """Parse [EXECUTE_ROADMAP] signal from CTO response.
+    Returns (clean_text, should_execute).
+    """
+    has_execute = bool(_EXECUTE_ROADMAP_PATTERN.search(text))
+    clean = _EXECUTE_ROADMAP_PATTERN.sub("", text).strip()
+    return clean, has_execute
 
 
 @dataclass

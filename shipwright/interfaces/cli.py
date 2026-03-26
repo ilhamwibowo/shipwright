@@ -57,11 +57,14 @@ BANNER = f"""\
 
 # Commands recognised by the REPL (for tab completion)
 _COMMANDS = [
+    "approve",
     "assign",
     "back",
+    "continue",
     "costs",
     "exit",
     "fire",
+    "go",
     "help",
     "hire",
     "history",
@@ -69,6 +72,8 @@ _COMMANDS = [
     "installed",
     "promote",
     "quit",
+    "resume",
+    "roadmap",
     "roles",
     "save",
     "session clear",
@@ -431,7 +436,17 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
                 # Reset employee status if it was mid-work
                 if active and active.status == EmployeeStatus.WORKING:
                     active.status = EmployeeStatus.IDLE
-                print(f"\n  {DIM}Cancelled.{RESET}\n")
+                # Pause roadmap if one is running
+                if router.company.active_roadmap and not router.company.active_roadmap.paused:
+                    router.company.active_roadmap.paused = True
+                    # Mark any running task back to pending
+                    for t in router.company.active_roadmap.tasks:
+                        if t.status.value == "running":
+                            from shipwright.company.employee import RoadmapTaskStatus
+                            t.status = RoadmapTaskStatus.PENDING
+                    print(f"\n  {YELLOW}Roadmap paused.{RESET} Type `continue` to resume.\n")
+                else:
+                    print(f"\n  {DIM}Cancelled.{RESET}\n")
                 continue
             except asyncio.CancelledError:
                 ui.finish_response()
