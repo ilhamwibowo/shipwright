@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from shipwright.config import Config
+from shipwright.company.company import Company
 from shipwright.company.employee import EmployeeStatus, MemberResult, Task
 from shipwright.company.roles import get_role_def
 from shipwright.conversation.router import Router
@@ -426,11 +427,16 @@ class TestEmptyCompanyEdgeCases:
         assert "No employees" in response
 
     @pytest.mark.asyncio
-    async def test_message_with_no_employees(self, config: Config):
+    async def test_message_routes_to_cto(self, config: Config):
+        """Free-form messages auto-create CTO and route through CTO flow."""
         router = _make_router(config)
-        response = await router.handle_message("hello there")
-        assert "No employees" in response
-        assert "hire" in response.lower()
+        with patch.object(
+            Company, "cto_chat", new_callable=AsyncMock,
+            return_value="I'll handle this.",
+        ):
+            response = await router.handle_message("hello there")
+        assert "CTO" in router.company.employees
+        assert "I'll handle this." in response
 
 
 # ---------------------------------------------------------------------------
@@ -468,10 +474,13 @@ class TestInputEdgeCases:
     async def test_very_long_input(self, config: Config):
         router = _make_router(config)
         long_text = "a" * 20_000
-        # Should not crash — truncated internally
-        response = await router.handle_message(long_text)
-        # Will be treated as conversational input with no employees
-        assert "No employees" in response or response == ""
+        # Should not crash — truncated internally, routes to CTO
+        with patch.object(
+            Company, "cto_chat", new_callable=AsyncMock,
+            return_value="Got it.",
+        ):
+            response = await router.handle_message(long_text)
+        assert response  # Non-empty response
 
     @pytest.mark.asyncio
     async def test_special_characters_in_task(self, config: Config):
@@ -570,3 +579,92 @@ class TestSDKErrorRecovery:
 
         assert "Error" in response
         assert alex.status == EmployeeStatus.IDLE
+
+
+# ---------------------------------------------------------------------------
+# CTO routing
+# ---------------------------------------------------------------------------
+
+
+class TestCTORouting:
+    @pytest.mark.asyncio
+    async def test_at_name_routes_to_employee(self, config: Config):
+        """@name message routes directly to the named employee."""
+        router = _make_router_with_employees(config)
+        alex = router.company.employees["Alex"]
+
+        mock_result = MemberResult(output="Got it, working on it.", total_cost_usd=0.01)
+        with patch.object(alex, "run", new_callable=AsyncMock, return_value=mock_result):
+            response = await router.handle_message("@Alex use repository pattern")
+
+        assert "Got it" in response
+
+    @pytest.mark.asyncio
+    async def test_at_name_unknown_employee(self, config: Config):
+        """@name with unknown name returns error."""
+        router = _make_router(config)
+        response = await router.handle_message("@Nobody do something")
+        assert "No employee" in response
+
+    def test_back_command_returns_to_cto(self, config: Config):
+        """'back' command switches active employee to CTO."""
+        router = _make_router_with_employees(config)
+        router.company.ensure_cto()
+        router.company.set_active("Alex")
+
+        _, response = router._try_sync_command("back", "back")
+        assert "CTO" in response
+        assert router.company._active_employee == "CTO"
+
+    def test_back_command_creates_cto_if_needed(self, config: Config):
+        """'back' creates CTO if none exists."""
+        router = _make_router(config)
+        _, response = router._try_sync_command("back", "back")
+        assert "CTO" in response
+        assert router.company.get_cto() is not None
+
+    @pytest.mark.asyncio
+    async def test_cto_is_default_conversation_target(self, config: Config):
+        """Free-form text goes to CTO when no other employee is active."""
+        router = _make_router(config)
+        with patch.object(
+            Company, "cto_chat", new_callable=AsyncMock,
+            return_value="Let me look into this.",
+        ):
+            response = await router.handle_message("Add payments")
+        assert "look into this" in response
+
+    @pytest.mark.asyncio
+    async def test_talk_switches_away_from_cto(self, config: Config):
+        """'talk name' switches from CTO to that employee."""
+        router = _make_router_with_employees(config)
+        router.company.ensure_cto()
+        router.company.set_active("CTO")
+
+        _, response = router._try_sync_command("talk Alex", "talk alex")
+        assert "Alex" in response
+        assert router.company._active_employee == "Alex"
+
+    @pytest.mark.asyncio
+    async def test_non_cto_active_skips_cto_flow(self, config: Config):
+        """When a non-CTO employee is active, messages go to them directly."""
+        router = _make_router_with_employees(config)
+        router.company.set_active("Alex")
+        alex = router.company.employees["Alex"]
+
+        mock_result = MemberResult(output="Direct response.", total_cost_usd=0.01)
+        with patch.object(alex, "run", new_callable=AsyncMock, return_value=mock_result):
+            response = await router.handle_message("What's the status?")
+
+        assert "Direct response" in response
+
+    @pytest.mark.asyncio
+    async def test_cto_error_recovery(self, config: Config):
+        """CTO errors are caught and reported gracefully."""
+        router = _make_router(config)
+        with patch.object(
+            Company, "cto_chat", new_callable=AsyncMock,
+            side_effect=RuntimeError("SDK connection failed"),
+        ):
+            response = await router.handle_message("Build something")
+        assert "Error" in response

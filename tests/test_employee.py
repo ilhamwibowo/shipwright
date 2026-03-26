@@ -1,4 +1,4 @@
-"""Tests for the V2 Employee module: Employee, Task, delegation parsing, name pool."""
+"""Tests for the V2 Employee module: Employee, Task, delegation parsing, name pool, CTO parsing."""
 
 import time
 
@@ -9,10 +9,14 @@ from shipwright.company.employee import (
     DelegationRequest,
     Employee,
     EmployeeStatus,
+    HireRequest,
     NAME_POOL,
+    ReviseRequest,
     Task,
     next_name,
     parse_delegations,
+    parse_hire_blocks,
+    parse_revise_blocks,
 )
 
 
@@ -310,3 +314,135 @@ class TestEmployeeStatus:
     def test_string_comparison(self):
         assert EmployeeStatus.IDLE == "idle"
         assert EmployeeStatus.WORKING == "working"
+
+
+# ---------------------------------------------------------------------------
+# CTO Hire Block Parsing
+# ---------------------------------------------------------------------------
+
+
+class TestHireParsing:
+    def test_no_hires(self):
+        text = "I'll analyze this and get back to you."
+        clean, hires = parse_hire_blocks(text)
+        assert clean == text
+        assert hires == []
+
+    def test_single_hire(self):
+        text = "We need a backend developer. [HIRE:backend-dev]"
+        clean, hires = parse_hire_blocks(text)
+        assert "[HIRE" not in clean
+        assert "backend developer" in clean
+        assert len(hires) == 1
+        assert hires[0].role == "backend-dev"
+        assert hires[0].name is None
+
+    def test_hire_with_name(self):
+        text = "Let me get someone on this. [HIRE:frontend-dev:Kai]"
+        clean, hires = parse_hire_blocks(text)
+        assert "[HIRE" not in clean
+        assert len(hires) == 1
+        assert hires[0].role == "frontend-dev"
+        assert hires[0].name == "Kai"
+
+    def test_multiple_hires(self):
+        text = (
+            "I'll need two people for this.\n"
+            "[HIRE:backend-dev]\n"
+            "[HIRE:frontend-dev:Sage]"
+        )
+        clean, hires = parse_hire_blocks(text)
+        assert len(hires) == 2
+        assert hires[0].role == "backend-dev"
+        assert hires[0].name is None
+        assert hires[1].role == "frontend-dev"
+        assert hires[1].name == "Sage"
+
+    def test_hire_block_stripped_from_clean_text(self):
+        text = "Before [HIRE:architect] After"
+        clean, hires = parse_hire_blocks(text)
+        assert "Before" in clean
+        assert "After" in clean
+        assert "[HIRE" not in clean
+        assert len(hires) == 1
+
+    def test_hire_with_hyphenated_role(self):
+        text = "[HIRE:qa-engineer]"
+        _, hires = parse_hire_blocks(text)
+        assert len(hires) == 1
+        assert hires[0].role == "qa-engineer"
+
+
+# ---------------------------------------------------------------------------
+# CTO Revise Block Parsing
+# ---------------------------------------------------------------------------
+
+
+class TestReviseParsing:
+    def test_no_revisions(self):
+        text = "This looks great. Ship it!"
+        clean, revisions = parse_revise_blocks(text)
+        assert clean == text
+        assert revisions == []
+
+    def test_single_revision(self):
+        text = (
+            "The API needs work.\n\n"
+            "[REVISE:Alex]\n"
+            "The error handling is missing. Add try/catch around the DB calls.\n"
+            "[/REVISE]"
+        )
+        clean, revisions = parse_revise_blocks(text)
+        assert "API needs work" in clean
+        assert "[REVISE" not in clean
+        assert len(revisions) == 1
+        assert revisions[0].employee_name == "Alex"
+        assert "error handling" in revisions[0].feedback
+
+    def test_multiple_revisions(self):
+        text = (
+            "Two things need fixing.\n\n"
+            "[REVISE:Alex]\n"
+            "Add input validation.\n"
+            "[/REVISE]\n\n"
+            "[REVISE:Blake]\n"
+            "Fix the CSS alignment.\n"
+            "[/REVISE]"
+        )
+        clean, revisions = parse_revise_blocks(text)
+        assert "Two things" in clean
+        assert len(revisions) == 2
+        assert revisions[0].employee_name == "Alex"
+        assert revisions[1].employee_name == "Blake"
+        assert "validation" in revisions[0].feedback
+        assert "CSS" in revisions[1].feedback
+
+    def test_empty_feedback_ignored(self):
+        text = "[REVISE:Alex]\n\n[/REVISE]"
+        _, revisions = parse_revise_blocks(text)
+        assert revisions == []
+
+    def test_revise_block_stripped_from_clean_text(self):
+        text = (
+            "Before.\n\n"
+            "[REVISE:Alex]\nFix this.\n[/REVISE]\n\n"
+            "After."
+        )
+        clean, revisions = parse_revise_blocks(text)
+        assert "Before." in clean
+        assert "After." in clean
+        assert "[REVISE" not in clean
+        assert len(revisions) == 1
+
+    def test_multiline_feedback(self):
+        text = (
+            "[REVISE:Blake]\n"
+            "1. Fix the error handling.\n"
+            "2. Add input validation.\n"
+            "3. Write tests for edge cases.\n"
+            "[/REVISE]"
+        )
+        _, revisions = parse_revise_blocks(text)
+        assert len(revisions) == 1
+        assert "1. Fix" in revisions[0].feedback
+        assert "3. Write" in revisions[0].feedback

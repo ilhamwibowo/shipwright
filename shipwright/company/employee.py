@@ -128,6 +128,64 @@ def parse_delegations(text: str) -> tuple[str, list[DelegationRequest]]:
     return clean_text, delegations
 
 
+# ---------------------------------------------------------------------------
+# CTO block parsing — [HIRE:role], [HIRE:role:name], [REVISE:name]
+# ---------------------------------------------------------------------------
+
+_HIRE_PATTERN = re.compile(
+    r"\[HIRE:([\w-]+)(?::([\w]+))?\]",
+)
+
+_REVISE_PATTERN = re.compile(
+    r"\[REVISE:(\w+)\]\s*\n(.*?)\[/REVISE\]",
+    re.DOTALL,
+)
+
+
+@dataclass
+class HireRequest:
+    """A parsed hire request from the CTO's response."""
+    role: str
+    name: str | None = None
+
+
+@dataclass
+class ReviseRequest:
+    """A parsed revision request from the CTO's response."""
+    employee_name: str
+    feedback: str
+
+
+def parse_hire_blocks(text: str) -> tuple[str, list[HireRequest]]:
+    """Parse [HIRE:role] and [HIRE:role:name] blocks from CTO response.
+    Returns (clean_text with blocks removed, list of HireRequests).
+    """
+    hires: list[HireRequest] = []
+    for match in _HIRE_PATTERN.finditer(text):
+        role = match.group(1).strip()
+        name = match.group(2)
+        if name:
+            name = name.strip()
+        if role:
+            hires.append(HireRequest(role=role, name=name))
+    clean_text = _HIRE_PATTERN.sub("", text).strip()
+    return clean_text, hires
+
+
+def parse_revise_blocks(text: str) -> tuple[str, list[ReviseRequest]]:
+    """Parse [REVISE:name] blocks from CTO response.
+    Returns (clean_text with blocks removed, list of ReviseRequests).
+    """
+    revisions: list[ReviseRequest] = []
+    for match in _REVISE_PATTERN.finditer(text):
+        name = match.group(1).strip()
+        feedback = match.group(2).strip()
+        if name and feedback:
+            revisions.append(ReviseRequest(employee_name=name, feedback=feedback))
+    clean_text = _REVISE_PATTERN.sub("", text).strip()
+    return clean_text, revisions
+
+
 @dataclass
 class LeadResponse:
     """Parsed response from a team lead."""
@@ -248,19 +306,22 @@ class Employee:
         task: str,
         context: str = "",
         on_text: Callable[[str], None] | None = None,
+        system_prompt: str | None = None,
     ) -> MemberResult:
         """Execute a task using the Claude Code SDK.
 
         Uses session_id for memory continuity across tasks.
+        If system_prompt is provided, it overrides the role_def.prompt.
         """
         prompt = task
         if context:
             prompt = f"{context}\n\n---\n\nTask:\n{task}"
 
         effective_model = self.role_def.model or self.model
+        effective_prompt = system_prompt or self.role_def.prompt
 
         options = ClaudeCodeOptions(
-            system_prompt=self.role_def.prompt,
+            system_prompt=effective_prompt,
             allowed_tools=self.role_def.tools,
             permission_mode=self.permission_mode,
             max_turns=self.role_def.max_turns,

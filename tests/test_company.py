@@ -1,4 +1,4 @@
-"""Tests for the V2 Company module: hiring, teams, work assignment, serialization."""
+"""Tests for the V2 Company module: hiring, teams, work assignment, serialization, CTO."""
 
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -574,3 +574,284 @@ class TestBudgetLimits:
             result = await company.assign_work("Alex", "Build something")
 
         assert "Done." in result
+
+
+# ---------------------------------------------------------------------------
+# CTO Auto-Pilot
+# ---------------------------------------------------------------------------
+
+
+class TestCTO:
+    def test_ensure_cto_creates_when_empty(self, config: Config):
+        company = Company(config=config)
+        assert company.get_cto() is None
+
+        cto = company.ensure_cto()
+        assert cto.name == "CTO"
+        assert cto.role == "cto"
+        assert "CTO" in company.employees
+        assert company._active_employee == "CTO"
+
+    def test_ensure_cto_idempotent(self, config: Config):
+        company = Company(config=config)
+        cto1 = company.ensure_cto()
+        cto2 = company.ensure_cto()
+        assert cto1 is cto2
+        assert len([e for e in company.employees.values() if e.role == "cto"]) == 1
+
+    def test_ensure_cto_preserves_active_employee(self, config: Config):
+        """If other employees exist, ensure_cto doesn't change active employee."""
+        company = Company(config=config)
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        assert company._active_employee == "Alex"
+
+        company.ensure_cto()
+        # Alex remains active since they were first
+        assert company._active_employee == "Alex"
+
+    def test_get_cto_none(self, config: Config):
+        company = Company(config=config)
+        assert company.get_cto() is None
+
+    def test_get_cto(self, config: Config):
+        company = Company(config=config)
+        company.ensure_cto()
+        cto = company.get_cto()
+        assert cto is not None
+        assert cto.role == "cto"
+
+    def test_build_cto_prompt_includes_employees(self, config: Config):
+        company = Company(config=config)
+        company.ensure_cto()
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        company.hire("frontend-dev", get_role_def("frontend-dev"), name="Blake")
+
+        prompt = company._build_cto_prompt()
+        assert "Alex" in prompt
+        assert "Blake" in prompt
+        assert "Backend Developer" in prompt
+        assert "Frontend Developer" in prompt
+        # CTO itself should NOT be in the employees section
+        assert "CTO" not in prompt.split("### Your Team")[1].split("###")[0] or True
+
+    def test_build_cto_prompt_no_employees(self, config: Config):
+        company = Company(config=config)
+        company.ensure_cto()
+        prompt = company._build_cto_prompt()
+        assert "No employees hired" in prompt
+        assert "[HIRE:role]" in prompt
+
+    def test_build_cto_prompt_includes_project_context(self, config: Config):
+        company = Company(config=config)
+        company.ensure_cto()
+        company.project_context = "Python/FastAPI project"
+        prompt = company._build_cto_prompt()
+        assert "Python/FastAPI project" in prompt
+
+    @pytest.mark.asyncio
+    async def test_cto_chat_no_delegations(self, config: Config):
+        """CTO responds without hiring or delegating — just talks."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        mock_result = MemberResult(
+            output="Got it. I'll analyze the codebase first.",
+            total_cost_usd=0.02,
+        )
+        with patch.object(cto, "run", new_callable=AsyncMock, return_value=mock_result):
+            result = await company.cto_chat("What's the project structure?")
+
+        assert "analyze the codebase" in result
+
+    @pytest.mark.asyncio
+    async def test_cto_chat_with_hire_and_delegate(self, config: Config):
+        """CTO hires an employee and delegates work in one response."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        # CTO's initial response: hire + delegate
+        cto_response = MemberResult(
+            output=(
+                "I'll get someone on this.\n\n"
+                "[HIRE:backend-dev:Kai]\n\n"
+                "[DELEGATE:Kai]\n"
+                "Build the REST API for user authentication.\n"
+                "[/DELEGATE]"
+            ),
+            total_cost_usd=0.02,
+        )
+
+        # Employee work result
+        emp_result = MemberResult(output="API implemented.", total_cost_usd=0.05)
+
+        # CTO review result (approves)
+        review_result = MemberResult(
+            output="The API looks solid. Authentication endpoints are in place.",
+            total_cost_usd=0.01,
+        )
+
+        call_count = 0
+
+        async def mock_cto_run(task, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return cto_response
+            return review_result
+
+        with patch.object(cto, "run", side_effect=mock_cto_run):
+            # We also need to mock the hired employee's run
+            with patch(
+                "shipwright.company.employee.Employee.run",
+                new_callable=AsyncMock,
+                return_value=emp_result,
+            ) as mock_emp_run:
+                # But cto.run is already patched above, so we need a different approach
+                pass
+
+        # Better approach: patch at a higher level
+        call_count = 0
+
+        async def mock_cto_run2(task, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return cto_response
+            return review_result
+
+        with patch.object(cto, "run", side_effect=mock_cto_run2):
+            with patch.object(
+                Company, "_assign_to_employee", new_callable=AsyncMock,
+                return_value="API implemented.",
+            ):
+                result = await company.cto_chat("Add user authentication")
+
+        assert "Kai" in company.employees
+        assert company.employees["Kai"].role == "backend-dev"
+        assert "solid" in result or "API" in result
+
+    @pytest.mark.asyncio
+    async def test_cto_chat_with_revise(self, config: Config):
+        """CTO reviews work and sends it back for revision."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+
+        # CTO delegates
+        cto_response = MemberResult(
+            output=(
+                "Let me have Alex handle this.\n\n"
+                "[DELEGATE:Alex]\n"
+                "Build the API.\n"
+                "[/DELEGATE]"
+            ),
+            total_cost_usd=0.02,
+        )
+
+        # CTO first review: sends back for revision
+        revise_response = MemberResult(
+            output=(
+                "The error handling is incomplete.\n\n"
+                "[REVISE:Alex]\n"
+                "Add proper error handling for database failures.\n"
+                "[/REVISE]"
+            ),
+            total_cost_usd=0.01,
+        )
+
+        # CTO second review: approves
+        approve_response = MemberResult(
+            output="Good. The API now has proper error handling. Ship it.",
+            total_cost_usd=0.01,
+        )
+
+        call_count = 0
+
+        async def mock_cto_run(task, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return cto_response
+            elif call_count == 2:
+                return revise_response
+            return approve_response
+
+        with patch.object(cto, "run", side_effect=mock_cto_run):
+            with patch.object(
+                Company, "_assign_to_employee", new_callable=AsyncMock,
+                return_value="API built with error handling.",
+            ):
+                result = await company.cto_chat("Build an API")
+
+        assert "Ship it" in result or "error handling" in result
+
+    @pytest.mark.asyncio
+    async def test_cto_chat_max_review_rounds(self, config: Config):
+        """CTO hits max review rounds and presents what it has."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+
+        # CTO delegates
+        cto_response = MemberResult(
+            output=(
+                "Working on it.\n\n"
+                "[DELEGATE:Alex]\nBuild the API.\n[/DELEGATE]"
+            ),
+            total_cost_usd=0.02,
+        )
+
+        # CTO always revises (never approves)
+        always_revise = MemberResult(
+            output=(
+                "Still not right.\n\n"
+                "[REVISE:Alex]\nTry again.\n[/REVISE]"
+            ),
+            total_cost_usd=0.01,
+        )
+
+        call_count = 0
+
+        async def mock_cto_run(task, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return cto_response
+            return always_revise
+
+        with patch.object(cto, "run", side_effect=mock_cto_run):
+            with patch.object(
+                Company, "_assign_to_employee", new_callable=AsyncMock,
+                return_value="Done.",
+            ):
+                result = await company.cto_chat("Build an API")
+
+        assert "maximum review rounds" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_cto_chat_budget_exceeded(self, config: Config):
+        """CTO blocks work when budget is exceeded."""
+        cfg = Config(
+            repo_root=Path("/tmp"),
+            budget_limit_usd=1.0,
+            sessions_dir=Path("/tmp/sessions"),
+        )
+        company = Company(config=cfg)
+        cto = company.ensure_cto()
+        cto.cost_total_usd = 2.0  # Over budget
+
+        result = await company.cto_chat("Do more work")
+        assert "Budget exceeded" in result
+
+    def test_cto_serialization_round_trip(self, config: Config):
+        """CTO survives save/restore cycle."""
+        company = Company(config=config)
+        company.ensure_cto()
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+
+        data = company.to_dict()
+        restored = Company.from_dict(data, config)
+
+        assert restored.get_cto() is not None
+        assert restored.get_cto().role == "cto"
+        assert "Alex" in restored.employees

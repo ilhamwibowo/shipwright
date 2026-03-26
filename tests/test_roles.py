@@ -22,6 +22,7 @@ from shipwright.company.roles import (
 
 class TestBuiltinRoles:
     EXPECTED_ROLES = {
+        "cto",
         "architect",
         "backend-dev",
         "frontend-dev",
@@ -36,7 +37,7 @@ class TestBuiltinRoles:
         "vp-engineering",
     }
 
-    def test_all_12_roles_exist(self):
+    def test_all_roles_exist(self):
         assert set(BUILTIN_ROLES.keys()) == self.EXPECTED_ROLES
 
     def test_get_role_def_works_for_each(self):

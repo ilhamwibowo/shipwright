@@ -25,8 +25,12 @@ from shipwright.company.employee import (
     Task,
     MemberResult,
     DelegationRequest,
+    HireRequest,
     LeadResponse,
+    ReviseRequest,
     parse_delegations,
+    parse_hire_blocks,
+    parse_revise_blocks,
     next_name,
 )
 from shipwright.utils.logging import get_logger
@@ -263,6 +267,300 @@ class Company:
         if name not in self.employees:
             raise ValueError(f"No employee named '{name}'.")
         self._active_employee = name
+
+    # ------------------------------------------------------------------
+    # CTO auto-pilot
+    # ------------------------------------------------------------------
+
+    def get_cto(self) -> Employee | None:
+        """Get the CTO employee, if one exists."""
+        for emp in self.employees.values():
+            if emp.role == "cto":
+                return emp
+        return None
+
+    def ensure_cto(self) -> Employee:
+        """Ensure a CTO employee exists. Creates one if needed. Idempotent."""
+        existing = self.get_cto()
+        if existing:
+            return existing
+
+        from shipwright.company.roles import get_role_def
+
+        role_def = get_role_def("cto")
+        cto = self.hire("cto", role_def, name="CTO")
+        # CTO should be active by default when it's the only employee
+        # (hire() already handles this via the "first hire" logic)
+        return cto
+
+    def _build_cto_prompt(self) -> str:
+        """Build the dynamic CTO system prompt with current company state."""
+        from shipwright.company.roles import get_role_def
+
+        base_prompt = get_role_def("cto").prompt
+
+        # Employee section
+        emp_lines = []
+        for emp in self.employees.values():
+            if emp.role == "cto":
+                continue
+            status = emp.status.value
+            if emp.current_task:
+                status = f"working: {emp.current_task.description[:50]}"
+            team_tag = f" [{emp.team}]" if emp.team else ""
+            task_count = len(emp.task_history)
+            last_task = ""
+            if emp.task_history:
+                lt = emp.task_history[-1]
+                last_task = f" — last: {lt.description[:40]} ({lt.status})"
+            emp_lines.append(
+                f"- **{emp.name}** ({emp.display_role}){team_tag} — "
+                f"{status}, {task_count} tasks done{last_task}"
+            )
+
+        employees_section = (
+            "\n".join(emp_lines)
+            if emp_lines
+            else "No employees hired yet. Hire with [HIRE:role] or [HIRE:role:name]."
+        )
+
+        # Recent tasks
+        recent_tasks = []
+        for emp in self.employees.values():
+            if emp.role == "cto":
+                continue
+            for task in emp.task_history[-3:]:
+                icon = "DONE" if task.status == "done" else "FAILED"
+                recent_tasks.append(
+                    f"- [{icon}] {emp.name}: {task.description[:60]}"
+                )
+        tasks_section = (
+            "\n".join(recent_tasks[-10:])
+            if recent_tasks
+            else "No tasks completed yet."
+        )
+
+        return f"""{base_prompt}
+
+## Current Company State
+
+### Your Team
+{employees_section}
+
+### Recent Work
+{tasks_section}
+
+### Project
+{self.project_context or "No project context loaded yet."}
+"""
+
+    async def cto_chat(
+        self,
+        message: str,
+        on_text: Callable[[str], None] | None = None,
+        on_delegation_start: Callable[[str, str, int, int], None] | None = None,
+        on_delegation_end: Callable[[str, float, bool], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> str:
+        """Full CTO flow: respond → hire → delegate → review → present.
+
+        The CTO processes the user's message, optionally hires employees,
+        delegates work, reviews results, and presents to the user.
+        """
+        cto = self.get_cto()
+        if not cto:
+            return "No CTO available."
+
+        system_prompt = self._build_cto_prompt()
+
+        # Budget check
+        budget = self.config.budget_limit_usd
+        if budget > 0 and self.total_cost >= budget:
+            return (
+                f"**Budget exceeded.** Spent ${self.total_cost:.4f} "
+                f"of ${budget:.2f} limit."
+            )
+
+        # Step 1: CTO responds to the user's message (streamed)
+        result = await cto.run(
+            task=message,
+            system_prompt=system_prompt,
+            on_text=on_text,
+        )
+        response_text = result.output
+
+        # Track CTO conversation
+        cto._conversation.append({"role": "user", "text": message})
+        cto._conversation.append({"role": "cto", "text": response_text})
+
+        # Step 2: Parse and process [HIRE] blocks
+        response_text, hires = parse_hire_blocks(response_text)
+        hire_messages = self._process_hires(hires)
+
+        # Step 3: Parse [DELEGATE] blocks
+        response_text, delegations = parse_delegations(response_text)
+
+        if not delegations:
+            # No delegations — CTO is just talking/planning
+            parts = []
+            if response_text:
+                parts.append(response_text)
+            if hire_messages:
+                parts.append("\n".join(hire_messages))
+            return "\n\n".join(parts) if parts else response_text
+
+        # Step 4: Execute delegations
+        results_summary = await self._execute_cto_delegations(
+            delegations,
+            on_delegation_start=on_delegation_start,
+            on_delegation_end=on_delegation_end,
+        )
+
+        # Step 5: Review loop — CTO reviews results, may revise
+        collected_output: list[str] = []
+        if response_text:
+            collected_output.append(response_text)
+        if hire_messages:
+            collected_output.append("\n".join(hire_messages))
+
+        max_review_rounds = 2
+        for review_round in range(max_review_rounds):
+            if on_progress:
+                on_progress("CTO reviewing results...")
+
+            # Refresh prompt with updated state
+            system_prompt = self._build_cto_prompt()
+
+            review_prompt = (
+                f"Here are the results from the team:\n\n{results_summary}\n\n"
+                "Review the work quality. Options:\n"
+                "1. If quality is good, present a summary to the CEO.\n"
+                "2. If something needs fixing, use [REVISE:EmployeeName] blocks "
+                "with specific feedback.\n"
+                "Be a quality gate — only present work you'd ship."
+            )
+
+            review_result = await cto.run(
+                task=review_prompt,
+                system_prompt=system_prompt,
+                on_text=None,  # Internal review — don't stream
+            )
+            review_text = review_result.output
+
+            cto._conversation.append(
+                {"role": "system", "text": f"Team results (round {review_round + 1})"}
+            )
+            cto._conversation.append({"role": "cto", "text": review_text})
+
+            # Parse [REVISE] and [HIRE] blocks from review
+            review_text, revisions = parse_revise_blocks(review_text)
+            review_text, more_hires = parse_hire_blocks(review_text)
+
+            # Process any additional hires
+            if more_hires:
+                hire_msgs = self._process_hires(more_hires)
+                if hire_msgs:
+                    collected_output.append("\n".join(hire_msgs))
+
+            if not revisions:
+                # CTO approved — stream the final presentation and return
+                if on_text and review_text:
+                    on_text("\n\n" + review_text)
+                collected_output.append(review_text)
+                return "\n\n".join(filter(None, collected_output))
+
+            # Process revisions — send feedback back to employees
+            revision_results = []
+            for rev in revisions:
+                if rev.employee_name not in self.employees:
+                    revision_results.append(
+                        f"### [FAILED] {rev.employee_name}\n"
+                        f"No employee named '{rev.employee_name}'."
+                    )
+                    continue
+
+                if on_progress:
+                    on_progress(f"{rev.employee_name} revising work...")
+
+                output = await self._assign_to_employee(
+                    rev.employee_name,
+                    f"Revise your previous work based on CTO feedback:\n\n{rev.feedback}",
+                )
+                truncated = output[:5000]
+                if len(output) > 5000:
+                    truncated += "\n... (truncated)"
+                revision_results.append(
+                    f"### [REVISED] {rev.employee_name}\n{truncated}"
+                )
+
+            results_summary = "\n\n".join(revision_results)
+
+        # Max review rounds reached — present what we have
+        collected_output.append(review_text)
+        collected_output.append(
+            "(Reached maximum review rounds. Presenting current results.)"
+        )
+        if on_text:
+            on_text(
+                "\n\n" + review_text
+                + "\n\n(Reached maximum review rounds. Presenting current results.)"
+            )
+        return "\n\n".join(filter(None, collected_output))
+
+    def _process_hires(self, hires: list[HireRequest]) -> list[str]:
+        """Process [HIRE] requests from CTO. Returns status messages."""
+        from shipwright.company.roles import get_role_def
+
+        messages = []
+        for h in hires:
+            try:
+                role_def = get_role_def(h.role, self.config)
+                emp = self.hire(h.role, role_def, name=h.name)
+                messages.append(f"Hired **{emp.name}** as {role_def.role}")
+                logger.info("CTO hired %s as %s", emp.name, h.role)
+            except (ValueError, Exception) as e:
+                messages.append(f"Failed to hire {h.role}: {e}")
+                logger.warning("CTO hire failed for %s: %s", h.role, e)
+        return messages
+
+    async def _execute_cto_delegations(
+        self,
+        delegations: list[DelegationRequest],
+        on_delegation_start: Callable[[str, str, int, int], None] | None = None,
+        on_delegation_end: Callable[[str, float, bool], None] | None = None,
+    ) -> str:
+        """Execute delegations from CTO. Returns formatted results summary."""
+        results_parts = []
+        for d in delegations:
+            if d.member_name not in self.employees:
+                results_parts.append(
+                    f"### [FAILED] {d.member_name}\n"
+                    f"No employee named '{d.member_name}'."
+                )
+                continue
+
+            if on_delegation_start:
+                on_delegation_start(d.member_name, d.task, 1, 1)
+
+            start_time = time.time()
+            output = await self._assign_to_employee(d.member_name, d.task)
+            duration = time.time() - start_time
+
+            emp = self.employees[d.member_name]
+            is_error = (
+                emp.task_history and emp.task_history[-1].status == "failed"
+            )
+
+            if on_delegation_end:
+                on_delegation_end(d.member_name, duration, is_error)
+
+            status = "FAILED" if is_error else "COMPLETED"
+            truncated = output[:5000]
+            if len(output) > 5000:
+                truncated += "\n... (truncated)"
+            results_parts.append(f"### [{status}] {d.member_name}\n{truncated}")
+
+        return "\n\n".join(results_parts)
 
     async def assign_work(
         self,

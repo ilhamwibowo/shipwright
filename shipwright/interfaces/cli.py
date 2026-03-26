@@ -58,6 +58,7 @@ BANNER = f"""\
 # Commands recognised by the REPL (for tab completion)
 _COMMANDS = [
     "assign",
+    "back",
     "costs",
     "exit",
     "fire",

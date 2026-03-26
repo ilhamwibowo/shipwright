@@ -73,9 +73,10 @@ class Router:
         """Process a user message and return the response.
 
         The dispatch order is:
+        0. Direct employee access: @name message
         1. Async commands that need ``await`` (assign work, ship)
         2. Synchronous commands (hire, fire, status, ...)
-        3. Conversational fallback — route to the active employee
+        3. Conversational fallback — route to CTO or active employee
         """
         text = text.strip()
         if not text:
@@ -93,6 +94,32 @@ class Router:
             self.company.project_context = self.project_info.to_prompt_context()
 
         lower = text.lower().strip()
+
+        # ---- 0. Direct employee access: @name message ----------------------
+        at_match = re.match(r'^@(\w+)\s+(.+)$', text, re.DOTALL)
+        if at_match:
+            name = at_match.group(1)
+            message = at_match.group(2).strip()
+            resolved = self._resolve_name(name)
+            if not resolved or resolved not in self.company.employees:
+                response = f"No employee named '{name}'."
+                self.session.add_system_message(response)
+                return response
+            try:
+                response = await self.company.talk(
+                    resolved, message,
+                    on_text=on_text,
+                    on_delegation_start=on_delegation_start,
+                    on_delegation_end=on_delegation_end,
+                    on_progress=on_progress,
+                )
+                self.session.add_lead_message(response, crew_id=resolved)
+                return response
+            except Exception as e:
+                logger.error("Error talking to %s: %s", resolved, e)
+                response = f"Error communicating with {resolved}: {e}"
+                self.session.add_system_message(response)
+                return response
 
         # ---- 1. Async: assign work -----------------------------------------
         # "assign <target> to <team>" — team membership (sync, handled below)
@@ -186,22 +213,39 @@ class Router:
             self.session.add_system_message(response)
             return response
 
-        # ---- 4. Conversational fallback — route to active employee ----------
+        # ---- 4. Conversational fallback — route to CTO or active employee ---
         employee = self.company.active_employee
         if not employee:
+            # No active employee — auto-create CTO
+            self.company.ensure_cto()
+            employee = self.company.active_employee
+
+        if not employee:
+            # Shouldn't happen with ensure_cto, but safety fallback
             response = self._suggest_hire(text)
             self.session.add_system_message(response)
             return response
 
         try:
-            response = await self.company.talk(
-                employee.name,
-                text,
-                on_text=on_text,
-                on_delegation_start=on_delegation_start,
-                on_delegation_end=on_delegation_end,
-                on_progress=on_progress,
-            )
+            if employee.role == "cto":
+                # Route through CTO auto-pilot flow
+                response = await self.company.cto_chat(
+                    message=text,
+                    on_text=on_text,
+                    on_delegation_start=on_delegation_start,
+                    on_delegation_end=on_delegation_end,
+                    on_progress=on_progress,
+                )
+            else:
+                # Direct conversation with active employee
+                response = await self.company.talk(
+                    employee.name,
+                    text,
+                    on_text=on_text,
+                    on_delegation_start=on_delegation_start,
+                    on_delegation_end=on_delegation_end,
+                    on_progress=on_progress,
+                )
             self.session.add_lead_message(response, crew_id=employee.name)
             return response
         except Exception as e:
@@ -218,6 +262,10 @@ class Router:
 
     def _try_sync_command(self, text: str, lower: str) -> tuple[bool, str]:
         """Try synchronous commands. Returns (is_command, response)."""
+
+        # back — return to CTO
+        if lower == "back":
+            return True, self._back()
 
         # roles
         if lower in ("roles", "available roles"):
@@ -502,6 +550,17 @@ class Router:
         emp = self.company.employees[resolved]
         return f"Now talking to **{resolved}** ({emp.display_role})."
 
+    def _back(self) -> str:
+        """Return conversation to the CTO."""
+        cto = self.company.get_cto()
+        if cto:
+            self.company.set_active(cto.name)
+            return "Back to **CTO**."
+        # No CTO yet — create one
+        cto = self.company.ensure_cto()
+        self.company.set_active(cto.name)
+        return "Back to **CTO**."
+
     def _status(self) -> str:
         return self._team_overview()
 
@@ -564,33 +623,34 @@ class Router:
     def _help(self) -> str:
         return (
             "**Shipwright Commands**\n\n"
+            "  Just type naturally — the CTO handles your requests.\n"
+            "  The CTO hires engineers, delegates work, reviews quality,\n"
+            "  and presents results. You only get asked when a decision is needed.\n\n"
+            "  `@<name> <message>` — Talk directly to an employee\n"
+            "  `back` — Return to CTO conversation\n"
+            "  `talk <name>` — Switch active employee\n"
+            "  `status` — Company overview\n"
+            "  `costs` — Budget/token usage per employee\n"
+            "  `history <name>` — Task history for an employee\n\n"
+            "  **Power user commands (bypass CTO):**\n"
             "  `roles` — List available roles to hire\n"
-            "  `hire <role>` — Hire an employee\n"
+            "  `hire <role>` — Hire an employee directly\n"
             '  `hire <role> as "Name"` — Hire with a custom name\n'
             "  `fire <name>` — Fire an employee\n"
             "  `fire <team>` — Fire an entire team\n"
-            "  `team` — Show company overview\n"
             "  `team create <name>` — Create a team\n"
             "  `promote <name> to lead of <team>` — Make someone team lead\n"
             "  `assign <name> to <team>` — Add employee to a team\n"
-            '  `assign <name> "<task>"` — Give work to an employee\n'
-            '  `assign <team> "<task>"` — Give work to a team (lead coordinates)\n'
-            "  `talk <name>` — Switch to talking to an employee\n"
-            "  `status` — Company overview\n"
-            "  `costs` — Budget/token usage per employee\n"
-            "  `history <name>` — Task history for an employee\n"
+            '  `assign <name> "<task>"` — Give work directly to an employee\n'
             "  `ship` — Open PR for all work\n"
-            "  `ship <team>` — Open PR for team's work\n"
             "  `save` — Save current state\n"
             "  `sessions` — List saved sessions\n"
-            "  `session save <name>` — Save as named session\n"
-            "  `session load <name>` — Load a named session\n"
+            "  `session save <name>` / `session load <name>` — Manage sessions\n"
             "  `session clear` — Reset everything\n"
             "  `shop` — Browse all available roles & specialists\n"
             "  `installed` — List custom/installed plugins\n"
             "  `inspect <name>` — Show role/specialist details\n"
-            "  `help` — Show this help\n\n"
-            "Or just type naturally — messages go to the active employee."
+            "  `help` — Show this help\n"
         )
 
     def _shop(self) -> str:
