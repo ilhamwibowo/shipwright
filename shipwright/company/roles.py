@@ -1165,7 +1165,7 @@ BUILTIN_ROLES: dict[str, MemberDef] = {
         prompt=_CTO_PROMPT,
         tools=["Read", "Glob", "Grep"],
         max_turns=15,
-        model="claude-sonnet-4-6",
+        model="claude-opus-4-6",
     ),
     "architect": MemberDef(
         role="Architect",
