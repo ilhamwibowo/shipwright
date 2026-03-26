@@ -67,6 +67,12 @@ class Config:
     # Budget limit (0 = no limit)
     budget_limit_usd: float = 0.0
 
+    # Max revision rounds in delegation loop (default: 3)
+    max_revision_rounds: int = 3
+
+    # Context reset threshold — reset employee session after N turns (default: 30)
+    context_reset_threshold: int = 30
+
     # Custom crew defs from shipwright.yaml
     custom_crews: dict[str, CrewDef] = field(default_factory=dict)
 
@@ -319,6 +325,8 @@ def load_config() -> Config:
         discord_channel_id=os.environ.get("DISCORD_CHANNEL_ID", ""),
         repo_root=repo_root,
         max_fix_attempts=int(os.environ.get("MAX_FIX_ATTEMPTS", "3")),
+        max_revision_rounds=int(os.environ.get("MAX_REVISION_ROUNDS", "3")),
+        context_reset_threshold=int(os.environ.get("CONTEXT_RESET_THRESHOLD", "30")),
         model=os.environ.get("SHIPWRIGHT_MODEL", "claude-sonnet-4-6"),
         permission_mode=os.environ.get("SHIPWRIGHT_PERMISSION_MODE", "bypassPermissions"),
         budget_limit_usd=float(os.environ.get("BUDGET_LIMIT_USD", "0")),

@@ -284,9 +284,13 @@ class TestWorkAssignment:
 
     @pytest.mark.asyncio
     async def test_max_delegation_rounds(self, config: Config):
-        """Delegation loop stops after max_delegation_rounds."""
+        """Delegation loop stops after config.max_revision_rounds."""
+        config = Config(
+            repo_root=config.repo_root,
+            max_revision_rounds=2,
+            sessions_dir=config.sessions_dir,
+        )
         company = Company(config=config)
-        company.max_delegation_rounds = 2
 
         lead_emp = company.hire("team-lead", get_role_def("team-lead"), name="Alex")
         member_emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Blake")

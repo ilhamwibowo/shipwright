@@ -150,6 +150,7 @@ class Company:
             cwd=cwd,
             model=self.config.model,
             permission_mode=self.config.permission_mode,
+            context_reset_threshold=self.config.context_reset_threshold,
         )
 
         self.employees[emp_name] = employee
@@ -640,14 +641,17 @@ class Company:
         on_delegation_start: Callable[[str, str, int, int], None] | None = None,
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
-        max_rounds: int = 2,
+        max_rounds: int | None = None,
     ) -> str:
         """Shared delegation loop for CTO and team-leads.
 
         Executes delegations, reviews results, handles revisions and
         additional delegations, returns the coordinator's final synthesis.
         Both CTO and team-leads use this — only the scope differs.
+        max_rounds defaults to config.max_revision_rounds if not provided.
         """
+        if max_rounds is None:
+            max_rounds = self.config.max_revision_rounds
         # Build context chain for this level
         chain = list(context_chain or [])
         if coordinator_text:
@@ -905,7 +909,6 @@ class Company:
             on_delegation_start=on_delegation_start,
             on_delegation_end=on_delegation_end,
             on_progress=on_progress,
-            max_rounds=self.max_delegation_rounds,
         )
 
         if loop_result:

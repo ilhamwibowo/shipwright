@@ -9,11 +9,13 @@ Each employee has:
 
 from __future__ import annotations
 
+import os
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Callable
 
 from claude_agent_sdk import (
@@ -289,6 +291,8 @@ class Employee:
     cwd: str = ""
     model: str = "claude-sonnet-4-6"
     permission_mode: str = "bypassPermissions"
+    _cumulative_turns: int = field(default=0, repr=False)
+    context_reset_threshold: int = 30
 
     @property
     def display_role(self) -> str:
@@ -301,6 +305,103 @@ class Employee:
     def session_id(self) -> str | None:
         return self._session_id
 
+    @property
+    def cumulative_turns(self) -> int:
+        return self._cumulative_turns
+
+    def _needs_context_reset(self) -> bool:
+        """Check if context has grown past the reset threshold."""
+        return (
+            self.context_reset_threshold > 0
+            and self._cumulative_turns >= int(self.context_reset_threshold * 0.8)
+        )
+
+    def _build_handoff_artifact(self, task_description: str = "") -> str:
+        """Build a structured handoff artifact summarising session state."""
+        recent = self._conversation[-20:]
+        conv_summary = []
+        for msg in recent:
+            role = msg.get("role", "?")
+            text = msg.get("text", "")[:300]
+            conv_summary.append(f"- [{role}] {text}")
+
+        recent_tasks = []
+        for t in self.task_history[-5:]:
+            status_icon = "DONE" if t.status == "done" else "FAILED"
+            recent_tasks.append(f"- [{status_icon}] {t.description[:80]}")
+
+        return (
+            f"# Handoff Artifact — {self.name} ({self.role})\n\n"
+            f"## Summary\n"
+            f"Employee **{self.name}** ({self.role_def.role}) has been working for "
+            f"{self._cumulative_turns} turns. Session is being reset to maintain quality.\n\n"
+            f"## State\n"
+            f"- Total cost: ${self.cost_total_usd:.4f}\n"
+            f"- Tasks completed: {len(self.task_history)}\n"
+            f"- Current task: {task_description or 'None'}\n"
+            f"- Team: {self.team or 'Unassigned'}\n\n"
+            f"## Recent Tasks\n"
+            + ("\n".join(recent_tasks) if recent_tasks else "No tasks yet.")
+            + "\n\n"
+            f"## Recent Conversation\n"
+            + ("\n".join(conv_summary) if conv_summary else "No conversation yet.")
+            + "\n\n"
+            f"## Next Steps\n"
+            f"Continue working on the current assignment. "
+            f"Refer to the task history and conversation above for context.\n\n"
+            f"## Key Decisions\n"
+            f"Preserve all prior implementation choices. "
+            f"Review the codebase state to pick up where you left off.\n"
+        )
+
+    def save_handoff_artifact(
+        self, task_description: str = "", data_dir: str | Path | None = None,
+    ) -> Path | None:
+        """Write a handoff artifact to .shipwright/handoffs/ and return the path."""
+        if data_dir is None:
+            data_dir = Path(self.cwd) / ".shipwright"
+        else:
+            data_dir = Path(data_dir)
+
+        handoffs_dir = data_dir / "handoffs"
+        handoffs_dir.mkdir(parents=True, exist_ok=True)
+
+        task_id = "general"
+        if self.current_task:
+            task_id = self.current_task.id
+        elif self.task_history:
+            task_id = self.task_history[-1].id
+
+        filename = f"{self.name.lower()}_{task_id}.md"
+        artifact_path = handoffs_dir / filename
+        artifact_content = self._build_handoff_artifact(task_description)
+        artifact_path.write_text(artifact_content)
+
+        logger.info(
+            "[%s] Handoff artifact saved to %s (%d turns)",
+            self.name, artifact_path, self._cumulative_turns,
+        )
+        return artifact_path
+
+    def context_reset(self, task_description: str = "", data_dir: str | Path | None = None) -> Path | None:
+        """Perform a full context reset: save handoff, clear session, return artifact path."""
+        artifact_path = self.save_handoff_artifact(task_description, data_dir)
+        old_turns = self._cumulative_turns
+        self._session_id = None
+        self._conversation.clear()
+        self._cumulative_turns = 0
+        logger.info(
+            "[%s] Context reset after %d turns (artifact: %s)",
+            self.name, old_turns, artifact_path,
+        )
+        return artifact_path
+
+    def _load_handoff_context(self, artifact_path: Path) -> str:
+        """Read a handoff artifact file and return its content as context."""
+        if artifact_path and artifact_path.exists():
+            return artifact_path.read_text()
+        return ""
+
     async def run(
         self,
         task: str,
@@ -312,7 +413,15 @@ class Employee:
 
         Uses session_id for memory continuity across tasks.
         If system_prompt is provided, it overrides the role_def.prompt.
+        Automatically performs a context reset when approaching the threshold.
         """
+        # Check for context reset before starting
+        if self._needs_context_reset() and self._session_id:
+            artifact_path = self.context_reset(task_description=task)
+            if artifact_path:
+                handoff_context = self._load_handoff_context(artifact_path)
+                context = f"{handoff_context}\n\n{context}" if context else handoff_context
+
         prompt = task
         if context:
             prompt = f"{context}\n\n---\n\nTask:\n{task}"
@@ -372,11 +481,13 @@ class Employee:
 
         result.output = "\n".join(collected_text)
         self.cost_total_usd += result.total_cost_usd
+        self._cumulative_turns += result.num_turns
 
         logger.info(
-            "[%s/%s] Done in %d turns (%.1fs, $%.4f)",
+            "[%s/%s] Done in %d turns (%.1fs, $%.4f, cumulative=%d)",
             self.name, self.role_def.role, result.num_turns,
             result.duration_ms / 1000, result.total_cost_usd,
+            self._cumulative_turns,
         )
         return result
 
@@ -479,6 +590,8 @@ class Employee:
             "conversation": self._conversation[-50:],
             "task_history": [t.to_dict() for t in self.task_history[-20:]],
             "current_task": self.current_task.to_dict() if self.current_task else None,
+            "cumulative_turns": self._cumulative_turns,
+            "context_reset_threshold": self.context_reset_threshold,
         }
 
     @classmethod
@@ -499,6 +612,8 @@ class Employee:
         )
         emp._session_id = data.get("session_id")
         emp._conversation = data.get("conversation", [])
+        emp._cumulative_turns = data.get("cumulative_turns", 0)
+        emp.context_reset_threshold = data.get("context_reset_threshold", 30)
         emp.task_history = [Task.from_dict(t) for t in data.get("task_history", [])]
         ct = data.get("current_task")
         if ct:
