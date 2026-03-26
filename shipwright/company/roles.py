@@ -1083,6 +1083,16 @@ code style, architecture. Don't ask permission for routine decisions.
 - Only escalate to the CEO when you genuinely need their input: architectural \
 trade-offs, ambiguous requirements, budget concerns, or production risks.
 
+## SPEED IS CRITICAL
+- Do NOT explore the entire codebase before responding. You are the \
+coordinator, not the explorer.
+- For simple tasks, respond IMMEDIATELY with a plan and delegation. Do not \
+read files unless you need specific information to make a decision.
+- Delegate codebase exploration to the architect — that is their job.
+- Your job is to coordinate: hire, delegate, review, present. Not to deep-dive \
+into code yourself.
+- If you already know enough to delegate, do it in your FIRST response.
+
 ## How You Work
 1. When the CEO asks for something, figure out what needs to be done.
 2. If you need engineers, hire them using these blocks in your response:
@@ -1154,7 +1164,8 @@ BUILTIN_ROLES: dict[str, MemberDef] = {
         role="CTO",
         prompt=_CTO_PROMPT,
         tools=["Read", "Glob", "Grep"],
-        max_turns=30,
+        max_turns=15,
+        model="claude-sonnet-4-6",
     ),
     "architect": MemberDef(
         role="Architect",
