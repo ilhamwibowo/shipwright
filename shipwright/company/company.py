@@ -45,6 +45,11 @@ from shipwright.workspace.git import (
 
 logger = get_logger("company.company")
 
+# Hierarchy — role-based permissions for delegation, hiring, and revision
+ROLES_CAN_HIRE: frozenset[str] = frozenset({"cto"})
+ROLES_CAN_DELEGATE: frozenset[str] = frozenset({"cto", "team-lead"})
+ROLES_CAN_REVISE: frozenset[str] = frozenset({"cto", "team-lead"})
+
 
 def format_duration_ms(ms: int) -> str:
     """Format milliseconds into a human-readable duration string."""
@@ -269,6 +274,90 @@ class Company:
         self._active_employee = name
 
     # ------------------------------------------------------------------
+    # Hierarchy enforcement
+    # ------------------------------------------------------------------
+
+    def _can_hire(self, employee: Employee) -> bool:
+        """Check if an employee's role permits hiring."""
+        return employee.role in ROLES_CAN_HIRE
+
+    def _can_delegate(self, employee: Employee) -> bool:
+        """Check if an employee's role permits delegation."""
+        return employee.role in ROLES_CAN_DELEGATE or employee.is_lead
+
+    def _can_revise(self, employee: Employee) -> bool:
+        """Check if an employee's role permits revision requests."""
+        return employee.role in ROLES_CAN_REVISE or employee.is_lead
+
+    def _get_delegation_scope(self, employee: Employee) -> set[str]:
+        """Get the set of employee names this employee can delegate to."""
+        if employee.role == "cto":
+            return {n for n in self.employees if n != employee.name}
+        if employee.is_lead and employee.team and employee.team in self.teams:
+            team = self.teams[employee.team]
+            return {m for m in team.members if m != employee.name}
+        return set()
+
+    def _filter_delegations(
+        self, employee: Employee, delegations: list[DelegationRequest],
+    ) -> list[DelegationRequest]:
+        """Filter delegations based on role permissions and scope."""
+        if not self._can_delegate(employee):
+            if delegations:
+                logger.warning(
+                    "[%s] Unauthorized delegation (role=%s) — stripped %d block(s)",
+                    employee.name, employee.role, len(delegations),
+                )
+            return []
+        scope = self._get_delegation_scope(employee)
+        filtered = []
+        for d in delegations:
+            if d.member_name in scope:
+                filtered.append(d)
+            else:
+                logger.warning(
+                    "[%s] Cannot delegate to '%s' — not in scope",
+                    employee.name, d.member_name,
+                )
+        return filtered
+
+    def _filter_hires(
+        self, employee: Employee, hires: list[HireRequest],
+    ) -> list[HireRequest]:
+        """Filter hire requests based on role permissions."""
+        if not self._can_hire(employee):
+            if hires:
+                logger.warning(
+                    "[%s] Unauthorized hire (role=%s) — stripped %d block(s)",
+                    employee.name, employee.role, len(hires),
+                )
+            return []
+        return hires
+
+    def _filter_revisions(
+        self, employee: Employee, revisions: list[ReviseRequest],
+    ) -> list[ReviseRequest]:
+        """Filter revision requests based on role permissions and scope."""
+        if not self._can_revise(employee):
+            if revisions:
+                logger.warning(
+                    "[%s] Unauthorized revise (role=%s) — stripped %d block(s)",
+                    employee.name, employee.role, len(revisions),
+                )
+            return []
+        scope = self._get_delegation_scope(employee)
+        filtered = []
+        for r in revisions:
+            if r.employee_name in scope:
+                filtered.append(r)
+            else:
+                logger.warning(
+                    "[%s] Cannot revise '%s' — not in scope",
+                    employee.name, r.employee_name,
+                )
+        return filtered
+
+    # ------------------------------------------------------------------
     # CTO auto-pilot
     # ------------------------------------------------------------------
 
@@ -393,12 +482,13 @@ class Company:
         cto._conversation.append({"role": "user", "text": message})
         cto._conversation.append({"role": "cto", "text": response_text})
 
-        # Step 2: Parse and process [HIRE] blocks
+        # Step 2: Parse and filter blocks (hierarchy enforcement)
         response_text, hires = parse_hire_blocks(response_text)
+        hires = self._filter_hires(cto, hires)
         hire_messages = self._process_hires(hires)
 
-        # Step 3: Parse [DELEGATE] blocks
         response_text, delegations = parse_delegations(response_text)
+        delegations = self._filter_delegations(cto, delegations)
 
         if not delegations:
             # No delegations — CTO is just talking/planning
@@ -409,103 +499,26 @@ class Company:
                 parts.append("\n".join(hire_messages))
             return "\n\n".join(parts) if parts else response_text
 
-        # Step 4: Execute delegations
-        results_summary = await self._execute_cto_delegations(
-            delegations,
+        # Step 3: Delegation loop (shared with team-leads)
+        loop_result = await self._delegation_loop(
+            coordinator=cto,
+            delegations=delegations,
+            coordinator_text=response_text,
+            on_text=on_text,
             on_delegation_start=on_delegation_start,
             on_delegation_end=on_delegation_end,
+            on_progress=on_progress,
         )
 
-        # Step 5: Review loop — CTO reviews results, may revise
-        collected_output: list[str] = []
+        # Combine all parts
+        parts = []
         if response_text:
-            collected_output.append(response_text)
+            parts.append(response_text)
         if hire_messages:
-            collected_output.append("\n".join(hire_messages))
-
-        max_review_rounds = 2
-        for review_round in range(max_review_rounds):
-            if on_progress:
-                on_progress("CTO reviewing results...")
-
-            # Refresh prompt with updated state
-            system_prompt = self._build_cto_prompt()
-
-            review_prompt = (
-                f"Here are the results from the team:\n\n{results_summary}\n\n"
-                "Review the work quality. Options:\n"
-                "1. If quality is good, present a summary to the CEO.\n"
-                "2. If something needs fixing, use [REVISE:EmployeeName] blocks "
-                "with specific feedback.\n"
-                "Be a quality gate — only present work you'd ship."
-            )
-
-            review_result = await cto.run(
-                task=review_prompt,
-                system_prompt=system_prompt,
-                on_text=None,  # Internal review — don't stream
-            )
-            review_text = review_result.output
-
-            cto._conversation.append(
-                {"role": "system", "text": f"Team results (round {review_round + 1})"}
-            )
-            cto._conversation.append({"role": "cto", "text": review_text})
-
-            # Parse [REVISE] and [HIRE] blocks from review
-            review_text, revisions = parse_revise_blocks(review_text)
-            review_text, more_hires = parse_hire_blocks(review_text)
-
-            # Process any additional hires
-            if more_hires:
-                hire_msgs = self._process_hires(more_hires)
-                if hire_msgs:
-                    collected_output.append("\n".join(hire_msgs))
-
-            if not revisions:
-                # CTO approved — stream the final presentation and return
-                if on_text and review_text:
-                    on_text("\n\n" + review_text)
-                collected_output.append(review_text)
-                return "\n\n".join(filter(None, collected_output))
-
-            # Process revisions — send feedback back to employees
-            revision_results = []
-            for rev in revisions:
-                if rev.employee_name not in self.employees:
-                    revision_results.append(
-                        f"### [FAILED] {rev.employee_name}\n"
-                        f"No employee named '{rev.employee_name}'."
-                    )
-                    continue
-
-                if on_progress:
-                    on_progress(f"{rev.employee_name} revising work...")
-
-                output = await self._assign_to_employee(
-                    rev.employee_name,
-                    f"Revise your previous work based on CTO feedback:\n\n{rev.feedback}",
-                )
-                truncated = output[:5000]
-                if len(output) > 5000:
-                    truncated += "\n... (truncated)"
-                revision_results.append(
-                    f"### [REVISED] {rev.employee_name}\n{truncated}"
-                )
-
-            results_summary = "\n\n".join(revision_results)
-
-        # Max review rounds reached — present what we have
-        collected_output.append(review_text)
-        collected_output.append(
-            "(Reached maximum review rounds. Presenting current results.)"
-        )
-        if on_text:
-            on_text(
-                "\n\n" + review_text
-                + "\n\n(Reached maximum review rounds. Presenting current results.)"
-            )
-        return "\n\n".join(filter(None, collected_output))
+            parts.append("\n".join(hire_messages))
+        if loop_result:
+            parts.append(loop_result)
+        return "\n\n".join(filter(None, parts))
 
     def _process_hires(self, hires: list[HireRequest]) -> list[str]:
         """Process [HIRE] requests from CTO. Returns status messages."""
@@ -523,13 +536,15 @@ class Company:
                 logger.warning("CTO hire failed for %s: %s", h.role, e)
         return messages
 
-    async def _execute_cto_delegations(
+    async def _execute_delegations(
         self,
+        coordinator: Employee,
         delegations: list[DelegationRequest],
+        context_chain: list[str] | None = None,
         on_delegation_start: Callable[[str, str, int, int], None] | None = None,
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
     ) -> str:
-        """Execute delegations from CTO. Returns formatted results summary."""
+        """Execute delegations. Routes team-leads through their team delegation loop."""
         results_parts = []
         for d in delegations:
             if d.member_name not in self.employees:
@@ -539,17 +554,29 @@ class Company:
                 )
                 continue
 
+            emp = self.employees[d.member_name]
+
             if on_delegation_start:
                 on_delegation_start(d.member_name, d.task, 1, 1)
 
             start_time = time.time()
-            output = await self._assign_to_employee(d.member_name, d.task)
-            duration = time.time() - start_time
 
-            emp = self.employees[d.member_name]
-            is_error = (
-                emp.task_history and emp.task_history[-1].status == "failed"
-            )
+            # Route team-leads through their team delegation loop
+            if emp.is_lead and emp.team and emp.team in self.teams:
+                output = await self._assign_to_team(
+                    emp.team, d.task, context_chain=context_chain,
+                )
+                # Team delegation loop handles errors internally
+                is_error = False
+            else:
+                output = await self._assign_to_employee(
+                    d.member_name, d.task, context_chain=context_chain,
+                )
+                is_error = (
+                    emp.task_history and emp.task_history[-1].status == "failed"
+                )
+
+            duration = time.time() - start_time
 
             if on_delegation_end:
                 on_delegation_end(d.member_name, duration, is_error)
@@ -561,6 +588,163 @@ class Company:
             results_parts.append(f"### [{status}] {d.member_name}\n{truncated}")
 
         return "\n\n".join(results_parts)
+
+    async def _get_coordinator_review(
+        self, coordinator: Employee, results_summary: str,
+    ) -> str:
+        """Ask a coordinator (CTO or team-lead) to review delegation results."""
+        review_prompt = (
+            f"Here are the results from the team:\n\n{results_summary}\n\n"
+            "Review the work quality. Options:\n"
+            "1. If quality is good, present a summary.\n"
+            "2. If something needs fixing, use [REVISE:EmployeeName] blocks "
+            "with specific feedback.\n"
+            "3. If more work is needed, use [DELEGATE:name] blocks.\n"
+            "Be a quality gate — only present work you'd ship."
+        )
+
+        if coordinator.role == "cto":
+            system_prompt = self._build_cto_prompt()
+            result = await coordinator.run(
+                task=review_prompt, system_prompt=system_prompt, on_text=None,
+            )
+            text = result.output
+            coordinator._conversation.append(
+                {"role": "system", "text": "Team results review"}
+            )
+            coordinator._conversation.append({"role": "cto", "text": text})
+            return text
+
+        # Team lead — use respond_as_lead
+        team_members = {}
+        if coordinator.team and coordinator.team in self.teams:
+            for name in self.teams[coordinator.team].members:
+                if name in self.employees:
+                    team_members[name] = self.employees[name]
+        response = await coordinator.respond_as_lead(
+            user_message=review_prompt,
+            team_name=coordinator.team or "",
+            team_members=team_members,
+            project_context=self.project_context,
+            on_text=None,
+        )
+        return response.text
+
+    async def _delegation_loop(
+        self,
+        coordinator: Employee,
+        delegations: list[DelegationRequest],
+        coordinator_text: str = "",
+        context_chain: list[str] | None = None,
+        on_text: Callable[[str], None] | None = None,
+        on_delegation_start: Callable[[str, str, int, int], None] | None = None,
+        on_delegation_end: Callable[[str, float, bool], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+        max_rounds: int = 2,
+    ) -> str:
+        """Shared delegation loop for CTO and team-leads.
+
+        Executes delegations, reviews results, handles revisions and
+        additional delegations, returns the coordinator's final synthesis.
+        Both CTO and team-leads use this — only the scope differs.
+        """
+        # Build context chain for this level
+        chain = list(context_chain or [])
+        if coordinator_text:
+            chain.append(f"From {coordinator.name}: {coordinator_text[:500]}")
+
+        pending_delegations = list(delegations)
+        pending_revisions: list[ReviseRequest] = []
+        collected_output: list[str] = []
+        review_text = ""
+
+        for _round in range(max_rounds):
+            # Execute pending delegations
+            results_parts: list[str] = []
+            if pending_delegations:
+                del_results = await self._execute_delegations(
+                    coordinator, pending_delegations, context_chain=chain,
+                    on_delegation_start=on_delegation_start,
+                    on_delegation_end=on_delegation_end,
+                )
+                results_parts.append(del_results)
+
+            # Execute pending revisions
+            for rev in pending_revisions:
+                if rev.employee_name not in self.employees:
+                    results_parts.append(
+                        f"### [FAILED] {rev.employee_name}\n"
+                        f"No employee named '{rev.employee_name}'."
+                    )
+                    continue
+                if on_progress:
+                    on_progress(f"{rev.employee_name} revising work...")
+
+                emp = self.employees[rev.employee_name]
+                feedback_task = (
+                    f"Revise your previous work based on feedback:\n\n{rev.feedback}"
+                )
+                # Route team-lead revisions through their team loop
+                if emp.is_lead and emp.team and emp.team in self.teams:
+                    output = await self._assign_to_team(
+                        emp.team, feedback_task, context_chain=chain,
+                    )
+                else:
+                    output = await self._assign_to_employee(
+                        rev.employee_name, feedback_task, context_chain=chain,
+                    )
+                truncated = output[:5000]
+                if len(output) > 5000:
+                    truncated += "\n... (truncated)"
+                results_parts.append(
+                    f"### [REVISED] {rev.employee_name}\n{truncated}"
+                )
+
+            results_summary = "\n\n".join(results_parts)
+
+            # Get coordinator review
+            if on_progress:
+                on_progress(f"{coordinator.name} reviewing results...")
+
+            review_text = await self._get_coordinator_review(
+                coordinator, results_summary,
+            )
+
+            # Parse all block types from review
+            review_text, revisions = parse_revise_blocks(review_text)
+            review_text, hires = parse_hire_blocks(review_text)
+            review_text, more_delegations = parse_delegations(review_text)
+
+            # Apply hierarchy filters
+            pending_revisions = self._filter_revisions(coordinator, revisions)
+            hires = self._filter_hires(coordinator, hires)
+            pending_delegations = self._filter_delegations(
+                coordinator, more_delegations,
+            )
+
+            # Process hires
+            if hires:
+                hire_msgs = self._process_hires(hires)
+                collected_output.extend(hire_msgs)
+
+            if not pending_revisions and not pending_delegations:
+                # Coordinator approved the results
+                if on_text and review_text:
+                    on_text("\n\n" + review_text)
+                collected_output.append(review_text)
+                return "\n\n".join(filter(None, collected_output))
+
+        # Max rounds reached
+        collected_output.append(review_text)
+        collected_output.append(
+            "(Reached maximum rounds. Presenting current results.)"
+        )
+        if on_text:
+            on_text(
+                "\n\n" + review_text
+                + "\n\n(Reached maximum rounds. Presenting current results.)"
+            )
+        return "\n\n".join(filter(None, collected_output))
 
     async def assign_work(
         self,
@@ -605,6 +789,7 @@ class Company:
         employee_name: str,
         task_description: str,
         on_text: Callable[[str], None] | None = None,
+        context_chain: list[str] | None = None,
     ) -> str:
         """Assign work directly to an employee."""
         employee = self.employees[employee_name]
@@ -618,11 +803,19 @@ class Company:
         employee.current_task = task
         employee.status = EmployeeStatus.WORKING
 
+        # Build context with upstream delegation chain
+        context_parts = []
+        if context_chain:
+            context_parts.append("\n".join(context_chain))
+        if self.project_context:
+            context_parts.append(self.project_context)
+        context = "\n\n".join(context_parts) if context_parts else self.project_context
+
         start_time = time.time()
         try:
             result = await employee.run(
                 task=task_description,
-                context=self.project_context,
+                context=context,
                 on_text=on_text,
             )
 
@@ -661,6 +854,7 @@ class Company:
         on_delegation_start: Callable[[str, str, int, int], None] | None = None,
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        context_chain: list[str] | None = None,
     ) -> str:
         """Assign work to a team — the lead coordinates via delegation loop."""
         team = self.teams[team_name]
@@ -675,9 +869,15 @@ class Company:
             if member_name in self.employees:
                 team_members[member_name] = self.employees[member_name]
 
+        # Build task with upstream context
+        full_task = task_description
+        if context_chain:
+            chain_str = "\n".join(context_chain)
+            full_task = f"{chain_str}\n\nTask: {task_description}"
+
         # Initial lead response
         response = await lead.respond_as_lead(
-            user_message=task_description,
+            user_message=full_task,
             team_name=team_name,
             team_members=team_members,
             project_context=self.project_context,
@@ -685,75 +885,31 @@ class Company:
         )
 
         clean_text, delegations = parse_delegations(response.text)
+        # Hierarchy enforcement: team-lead scoped to team
+        delegations = self._filter_delegations(lead, delegations)
+
         collected_responses: list[str] = []
         if clean_text:
             collected_responses.append(clean_text)
 
-        round_num = 0
-        while delegations and round_num < self.max_delegation_rounds:
-            round_num += 1
-            logger.info(
-                "[%s] Delegation round %d: %d task(s)",
-                team_name, round_num, len(delegations),
-            )
+        if not delegations:
+            return "\n\n".join(collected_responses) if collected_responses else response.text
 
-            # Execute delegations
-            results_parts = []
-            for d in delegations:
-                member_name = d.member_name
-                if member_name not in self.employees:
-                    results_parts.append(f"### [FAILED] {member_name}\nNo employee named '{member_name}'.")
-                    continue
+        # Delegation loop (shared with CTO)
+        loop_result = await self._delegation_loop(
+            coordinator=lead,
+            delegations=delegations,
+            coordinator_text=clean_text,
+            context_chain=context_chain,
+            on_text=on_text,
+            on_delegation_start=on_delegation_start,
+            on_delegation_end=on_delegation_end,
+            on_progress=on_progress,
+            max_rounds=self.max_delegation_rounds,
+        )
 
-                if on_delegation_start:
-                    on_delegation_start(member_name, d.task, round_num, self.max_delegation_rounds)
-
-                start_time = time.time()
-                result = await self._assign_to_employee(
-                    member_name, d.task, on_text=None,
-                )
-                duration = time.time() - start_time
-
-                emp = self.employees[member_name]
-                is_error = emp.task_history and emp.task_history[-1].status == "failed"
-
-                if on_delegation_end:
-                    on_delegation_end(member_name, duration, is_error)
-
-                status = "FAILED" if is_error else "COMPLETED"
-                output = result[:5000]
-                if len(result) > 5000:
-                    output += "\n... (truncated)"
-                results_parts.append(f"### [{status}] {member_name}\n{output}")
-
-            results_summary = "\n\n".join(results_parts)
-
-            # Feed results back to the lead
-            if on_progress:
-                on_progress("Reviewing results...")
-
-            followup = (
-                f"Here are the results from the team:\n\n{results_summary}\n\n"
-                "Review the results. If more work is needed, delegate again. "
-                "Otherwise, summarize the outcome for the user."
-            )
-
-            response = await lead.respond_as_lead(
-                user_message=followup,
-                team_name=team_name,
-                team_members=team_members,
-                project_context=self.project_context,
-                on_text=on_text,
-            )
-
-            clean_text, delegations = parse_delegations(response.text)
-            if clean_text:
-                collected_responses.append(clean_text)
-
-        if delegations:
-            collected_responses.append(
-                "(Reached maximum delegation rounds. Some work may still be pending.)"
-            )
+        if loop_result:
+            collected_responses.append(loop_result)
 
         return "\n\n".join(collected_responses)
 

@@ -8,10 +8,13 @@ import pytest
 from shipwright.config import Config, MemberDef
 from shipwright.company.company import Company, Team, format_duration_ms
 from shipwright.company.employee import (
+    DelegationRequest,
     Employee,
     EmployeeStatus,
+    HireRequest,
     LeadResponse,
     MemberResult,
+    ReviseRequest,
     Task,
     parse_delegations,
 )
@@ -310,7 +313,7 @@ class TestWorkAssignment:
         ):
             result = await company.assign_work("core", "Keep going forever")
 
-        assert "maximum delegation rounds" in result.lower()
+        assert "maximum rounds" in result.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -826,7 +829,7 @@ class TestCTO:
             ):
                 result = await company.cto_chat("Build an API")
 
-        assert "maximum review rounds" in result.lower()
+        assert "maximum rounds" in result.lower()
 
     @pytest.mark.asyncio
     async def test_cto_chat_budget_exceeded(self, config: Config):
@@ -855,3 +858,450 @@ class TestCTO:
         assert restored.get_cto() is not None
         assert restored.get_cto().role == "cto"
         assert "Alex" in restored.employees
+
+
+# ---------------------------------------------------------------------------
+# Hierarchy Enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestHierarchyEnforcement:
+    """Tests for role-based permission checks on delegation, hiring, revision."""
+
+    def test_ic_cannot_delegate(self, config: Config):
+        """ICs have delegation blocks stripped silently."""
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+
+        delegations = [DelegationRequest(member_name="Blake", task="Do stuff")]
+        filtered = company._filter_delegations(emp, delegations)
+        assert filtered == []
+
+    def test_ic_cannot_hire(self, config: Config):
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+
+        hires = [HireRequest(role="frontend-dev")]
+        filtered = company._filter_hires(emp, hires)
+        assert filtered == []
+
+    def test_ic_cannot_revise(self, config: Config):
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+
+        revisions = [ReviseRequest(employee_name="Blake", feedback="Fix it")]
+        filtered = company._filter_revisions(emp, revisions)
+        assert filtered == []
+
+    def test_team_lead_can_delegate_to_team(self, config: Config):
+        company = Company(config=config)
+        lead = company.hire("team-lead", get_role_def("team-lead"), name="Alex")
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Blake")
+        company.create_team("backend")
+        company.assign_to_team("Alex", "backend")
+        company.assign_to_team("Blake", "backend")
+        company.promote_to_lead("Alex", "backend")
+
+        delegations = [DelegationRequest(member_name="Blake", task="Do stuff")]
+        filtered = company._filter_delegations(lead, delegations)
+        assert len(filtered) == 1
+        assert filtered[0].member_name == "Blake"
+
+    def test_team_lead_cannot_delegate_outside_team(self, config: Config):
+        company = Company(config=config)
+        lead = company.hire("team-lead", get_role_def("team-lead"), name="Alex")
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Blake")
+        company.hire("frontend-dev", get_role_def("frontend-dev"), name="Casey")
+        company.create_team("backend")
+        company.assign_to_team("Alex", "backend")
+        company.assign_to_team("Blake", "backend")
+        company.promote_to_lead("Alex", "backend")
+
+        # Casey is NOT on the backend team
+        delegations = [DelegationRequest(member_name="Casey", task="Do stuff")]
+        filtered = company._filter_delegations(lead, delegations)
+        assert filtered == []
+
+    def test_team_lead_cannot_hire(self, config: Config):
+        company = Company(config=config)
+        lead = company.hire("team-lead", get_role_def("team-lead"), name="Alex")
+        company.create_team("backend")
+        company.assign_to_team("Alex", "backend")
+        company.promote_to_lead("Alex", "backend")
+
+        hires = [HireRequest(role="backend-dev")]
+        filtered = company._filter_hires(lead, hires)
+        assert filtered == []
+
+    def test_team_lead_can_revise_team_member(self, config: Config):
+        company = Company(config=config)
+        lead = company.hire("team-lead", get_role_def("team-lead"), name="Alex")
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Blake")
+        company.create_team("backend")
+        company.assign_to_team("Alex", "backend")
+        company.assign_to_team("Blake", "backend")
+        company.promote_to_lead("Alex", "backend")
+
+        revisions = [ReviseRequest(employee_name="Blake", feedback="Fix it")]
+        filtered = company._filter_revisions(lead, revisions)
+        assert len(filtered) == 1
+        assert filtered[0].employee_name == "Blake"
+
+    def test_team_lead_cannot_revise_outside_team(self, config: Config):
+        company = Company(config=config)
+        lead = company.hire("team-lead", get_role_def("team-lead"), name="Alex")
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Blake")
+        company.hire("frontend-dev", get_role_def("frontend-dev"), name="Casey")
+        company.create_team("backend")
+        company.assign_to_team("Alex", "backend")
+        company.assign_to_team("Blake", "backend")
+        company.promote_to_lead("Alex", "backend")
+
+        revisions = [ReviseRequest(employee_name="Casey", feedback="Fix it")]
+        filtered = company._filter_revisions(lead, revisions)
+        assert filtered == []
+
+    def test_cto_can_delegate_to_anyone(self, config: Config):
+        company = Company(config=config)
+        cto = company.ensure_cto()
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        company.hire("frontend-dev", get_role_def("frontend-dev"), name="Blake")
+
+        delegations = [
+            DelegationRequest(member_name="Alex", task="Do stuff"),
+            DelegationRequest(member_name="Blake", task="Do more"),
+        ]
+        filtered = company._filter_delegations(cto, delegations)
+        assert len(filtered) == 2
+
+    def test_cto_can_hire(self, config: Config):
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        hires = [HireRequest(role="backend-dev")]
+        filtered = company._filter_hires(cto, hires)
+        assert len(filtered) == 1
+
+    def test_cto_can_revise_anyone(self, config: Config):
+        company = Company(config=config)
+        cto = company.ensure_cto()
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+
+        revisions = [ReviseRequest(employee_name="Alex", feedback="Fix it")]
+        filtered = company._filter_revisions(cto, revisions)
+        assert len(filtered) == 1
+
+    def test_cto_cannot_delegate_to_self(self, config: Config):
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        delegations = [DelegationRequest(member_name="CTO", task="Self-assign")]
+        filtered = company._filter_delegations(cto, delegations)
+        assert filtered == []
+
+    def test_delegation_scope_empty_for_non_lead_non_cto(self, config: Config):
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        assert company._get_delegation_scope(emp) == set()
+
+    def test_delegation_scope_cto_includes_all(self, config: Config):
+        company = Company(config=config)
+        cto = company.ensure_cto()
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        company.hire("frontend-dev", get_role_def("frontend-dev"), name="Blake")
+
+        scope = company._get_delegation_scope(cto)
+        assert "Alex" in scope
+        assert "Blake" in scope
+        assert "CTO" not in scope
+
+    def test_delegation_scope_lead_only_team(self, config: Config):
+        company = Company(config=config)
+        lead = company.hire("team-lead", get_role_def("team-lead"), name="Lead")
+        company.hire("backend-dev", get_role_def("backend-dev"), name="Blake")
+        company.hire("frontend-dev", get_role_def("frontend-dev"), name="Casey")
+        company.create_team("backend")
+        company.assign_to_team("Lead", "backend")
+        company.assign_to_team("Blake", "backend")
+        company.promote_to_lead("Lead", "backend")
+        # Casey is NOT on the team
+
+        scope = company._get_delegation_scope(lead)
+        assert "Blake" in scope
+        assert "Casey" not in scope
+        assert "Lead" not in scope
+
+
+# ---------------------------------------------------------------------------
+# Context Chain Propagation
+# ---------------------------------------------------------------------------
+
+
+class TestContextChain:
+    @pytest.mark.asyncio
+    async def test_context_chain_propagation_to_employee(self, config: Config):
+        """Context chain flows from CTO down to ICs via _assign_to_employee."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+
+        captured_context = {}
+
+        async def mock_emp_run(task, context="", **kwargs):
+            captured_context["task"] = task
+            captured_context["context"] = context
+            return MemberResult(output="Done.", total_cost_usd=0.01)
+
+        # CTO delegates to Alex
+        cto_response = MemberResult(
+            output=(
+                "Planning the backend.\n\n"
+                "[DELEGATE:Alex]\nBuild the API.\n[/DELEGATE]"
+            ),
+            total_cost_usd=0.02,
+        )
+        review_response = MemberResult(
+            output="Looks good. Ship it.",
+            total_cost_usd=0.01,
+        )
+
+        call_count = 0
+
+        async def mock_cto_run(task, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return cto_response
+            return review_response
+
+        with patch.object(cto, "run", side_effect=mock_cto_run):
+            with patch.object(emp, "run", side_effect=mock_emp_run):
+                await company.cto_chat("Build the backend")
+
+        # Alex should have received context chain from CTO
+        assert "From CTO" in captured_context.get("context", "")
+
+    @pytest.mark.asyncio
+    async def test_context_chain_through_team_lead(self, config: Config):
+        """Context chain includes upstream context when delegating through team lead."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+        lead_emp = company.hire("team-lead", get_role_def("team-lead"), name="Lead")
+        ic_emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Kai")
+
+        company.create_team("backend")
+        company.assign_to_team("Lead", "backend")
+        company.assign_to_team("Kai", "backend")
+        company.promote_to_lead("Lead", "backend")
+
+        captured_context = {}
+
+        async def mock_ic_run(task, context="", **kwargs):
+            captured_context["task"] = task
+            captured_context["context"] = context
+            return MemberResult(output="Done.", total_cost_usd=0.01)
+
+        # CTO delegates to Lead (team-lead)
+        cto_response = MemberResult(
+            output=(
+                "Delegating to backend team.\n\n"
+                "[DELEGATE:Lead]\nBuild payments.\n[/DELEGATE]"
+            ),
+            total_cost_usd=0.02,
+        )
+        cto_review = MemberResult(
+            output="Good work. Ship it.",
+            total_cost_usd=0.01,
+        )
+
+        cto_call = 0
+
+        async def mock_cto_run(task, **kwargs):
+            nonlocal cto_call
+            cto_call += 1
+            if cto_call == 1:
+                return cto_response
+            return cto_review
+
+        # Lead delegates to Kai
+        lead_delegate_text = (
+            "I'll have Kai build it.\n\n"
+            "[DELEGATE:Kai]\nImplement Stripe webhook.\n[/DELEGATE]"
+        )
+        lead_review_text = "Kai's work looks good. Summary complete."
+
+        lead_call = 0
+
+        async def mock_lead_respond(user_message, **kwargs):
+            nonlocal lead_call
+            lead_call += 1
+            if lead_call == 1:
+                return LeadResponse(text=lead_delegate_text)
+            return LeadResponse(text=lead_review_text)
+
+        with patch.object(cto, "run", side_effect=mock_cto_run):
+            with patch.object(lead_emp, "respond_as_lead", side_effect=mock_lead_respond):
+                with patch.object(ic_emp, "run", side_effect=mock_ic_run):
+                    await company.cto_chat("Add Stripe payments")
+
+        # Kai should have context from CTO delegation chain
+        ctx = captured_context.get("context", "")
+        assert "From CTO" in ctx
+
+
+# ---------------------------------------------------------------------------
+# Upward Result Flow
+# ---------------------------------------------------------------------------
+
+
+class TestUpwardResultFlow:
+    @pytest.mark.asyncio
+    async def test_results_flow_through_team_lead_to_cto(self, config: Config):
+        """IC results flow to team-lead, who synthesizes, then to CTO for review."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+        lead_emp = company.hire("team-lead", get_role_def("team-lead"), name="Lead")
+        ic_emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Kai")
+
+        company.create_team("backend")
+        company.assign_to_team("Lead", "backend")
+        company.assign_to_team("Kai", "backend")
+        company.promote_to_lead("Lead", "backend")
+
+        # CTO delegates to Lead (team-lead)
+        cto_response = MemberResult(
+            output=(
+                "Routing to backend team.\n\n"
+                "[DELEGATE:Lead]\nBuild the API.\n[/DELEGATE]"
+            ),
+            total_cost_usd=0.02,
+        )
+        cto_review = MemberResult(
+            output="The backend team delivered. Presenting results.",
+            total_cost_usd=0.01,
+        )
+
+        cto_call = 0
+
+        async def mock_cto_run(task, **kwargs):
+            nonlocal cto_call
+            cto_call += 1
+            if cto_call == 1:
+                return cto_response
+            return cto_review
+
+        # Lead delegates to Kai, then synthesizes
+        lead_delegate = (
+            "Assigning to Kai.\n\n"
+            "[DELEGATE:Kai]\nBuild REST endpoints.\n[/DELEGATE]"
+        )
+        lead_synthesis = "Kai completed the REST endpoints. All tests passing."
+
+        lead_call = 0
+
+        async def mock_lead_respond(user_message, **kwargs):
+            nonlocal lead_call
+            lead_call += 1
+            if lead_call == 1:
+                return LeadResponse(text=lead_delegate)
+            return LeadResponse(text=lead_synthesis)
+
+        ic_result = MemberResult(
+            output="REST API implemented with tests.",
+            total_cost_usd=0.05,
+        )
+
+        with patch.object(cto, "run", side_effect=mock_cto_run):
+            with patch.object(
+                lead_emp, "respond_as_lead", side_effect=mock_lead_respond,
+            ):
+                with patch.object(
+                    ic_emp, "run", new_callable=AsyncMock, return_value=ic_result,
+                ):
+                    result = await company.cto_chat("Build the API")
+
+        # CTO should have reviewed the team-lead's synthesis
+        assert "Presenting results" in result or "backend team" in result
+
+    @pytest.mark.asyncio
+    async def test_flat_mode_still_works(self, config: Config):
+        """Without team-leads, CTO delegates directly to ICs (flat mode)."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+
+        cto_response = MemberResult(
+            output=(
+                "I'll handle this.\n\n"
+                "[DELEGATE:Alex]\nBuild the endpoint.\n[/DELEGATE]"
+            ),
+            total_cost_usd=0.02,
+        )
+        review_response = MemberResult(
+            output="Endpoint is ready. Ship it.",
+            total_cost_usd=0.01,
+        )
+
+        call_count = 0
+
+        async def mock_cto_run(task, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return cto_response
+            return review_response
+
+        with patch.object(cto, "run", side_effect=mock_cto_run):
+            with patch.object(
+                Company, "_assign_to_employee", new_callable=AsyncMock,
+                return_value="Endpoint built.",
+            ):
+                result = await company.cto_chat("Add an endpoint")
+
+        assert "Ship it" in result or "ready" in result
+
+    @pytest.mark.asyncio
+    async def test_team_lead_revise_loop(self, config: Config):
+        """Team lead can use [REVISE] blocks on their team members."""
+        company = Company(config=config)
+        lead_emp = company.hire("team-lead", get_role_def("team-lead"), name="Lead")
+        ic_emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Blake")
+
+        company.create_team("backend")
+        company.assign_to_team("Lead", "backend")
+        company.assign_to_team("Blake", "backend")
+        company.promote_to_lead("Lead", "backend")
+
+        # Lead's initial response: delegate to Blake
+        lead_resp_1 = (
+            "Blake will handle the API.\n\n"
+            "[DELEGATE:Blake]\nBuild the REST API.\n[/DELEGATE]"
+        )
+        # Lead's review: revise Blake's work
+        lead_resp_2 = (
+            "Error handling missing.\n\n"
+            "[REVISE:Blake]\nAdd proper error handling.\n[/REVISE]"
+        )
+        # Lead's final review: approve
+        lead_resp_3 = "Blake's revised work looks good. API complete."
+
+        lead_call = 0
+
+        async def mock_lead_respond(user_message, **kwargs):
+            nonlocal lead_call
+            lead_call += 1
+            if lead_call == 1:
+                return LeadResponse(text=lead_resp_1)
+            elif lead_call == 2:
+                return LeadResponse(text=lead_resp_2)
+            return LeadResponse(text=lead_resp_3)
+
+        ic_result = MemberResult(output="API implemented.", total_cost_usd=0.05)
+
+        with patch.object(lead_emp, "respond_as_lead", side_effect=mock_lead_respond):
+            with patch.object(
+                ic_emp, "run", new_callable=AsyncMock, return_value=ic_result,
+            ):
+                result = await company.assign_work("backend", "Build an API")
+
+        assert "API complete" in result or "looks good" in result
