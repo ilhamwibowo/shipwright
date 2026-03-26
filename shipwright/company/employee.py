@@ -1,4 +1,4 @@
-"""Employee — a persistent AI team member wrapping a Claude Code SDK session.
+"""Employee — a persistent AI team member wrapping a Claude Agent SDK session.
 
 Each employee has:
 - A name (auto-generated or user-chosen)
@@ -16,16 +16,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
 
-from claude_code_sdk import (
+from claude_agent_sdk import (
     AssistantMessage,
-    ClaudeCodeOptions,
+    ClaudeAgentOptions,
+    RateLimitEvent,
     ResultMessage,
     TextBlock,
     ThinkingBlock,
     ToolUseBlock,
     query,
 )
-import shipwright.sdk_patch  # noqa: ensure patch is applied
 
 from shipwright.config import MemberDef
 from shipwright.utils.logging import get_logger
@@ -267,7 +267,7 @@ def next_name(used_names: set[str]) -> str:
 
 @dataclass
 class Employee:
-    """A persistent AI team member backed by a Claude Code SDK session.
+    """A persistent AI team member backed by a Claude Agent SDK session.
 
     Can operate in two modes:
     1. Individual contributor: executes tasks directly via SDK
@@ -308,7 +308,7 @@ class Employee:
         on_text: Callable[[str], None] | None = None,
         system_prompt: str | None = None,
     ) -> MemberResult:
-        """Execute a task using the Claude Code SDK.
+        """Execute a task using the Claude Agent SDK.
 
         Uses session_id for memory continuity across tasks.
         If system_prompt is provided, it overrides the role_def.prompt.
@@ -320,7 +320,7 @@ class Employee:
         effective_model = self.role_def.model or self.model
         effective_prompt = system_prompt or self.role_def.prompt
 
-        options = ClaudeCodeOptions(
+        options = ClaudeAgentOptions(
             system_prompt=effective_prompt,
             allowed_tools=self.role_def.tools,
             permission_mode=self.permission_mode,
@@ -343,7 +343,8 @@ class Employee:
 
         try:
             async for message in query(prompt=prompt, options=options):
-                if message is None:
+                if isinstance(message, RateLimitEvent):
+                    logger.debug("[%s] Rate limited, retrying in %ss", self.name, getattr(message, "retry_after", "?"))
                     continue
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
@@ -409,7 +410,7 @@ class Employee:
 
         effective_model = self.role_def.model or self.model
 
-        options = ClaudeCodeOptions(
+        options = ClaudeAgentOptions(
             system_prompt=system_prompt,
             allowed_tools=["Read", "Glob", "Grep"],  # Lead is read-only
             permission_mode=self.permission_mode,
@@ -428,7 +429,8 @@ class Employee:
 
         try:
             async for message in query(prompt=prompt, options=options):
-                if message is None:
+                if isinstance(message, RateLimitEvent):
+                    logger.debug("[%s/lead] Rate limited, retrying in %ss", self.name, getattr(message, "retry_after", "?"))
                     continue
                 if isinstance(message, AssistantMessage):
                     for block in message.content:

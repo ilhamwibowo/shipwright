@@ -30,10 +30,9 @@ Company model — persistent employees organized into optional teams:
 shipwright/
 ├── main.py                  # CLI entry point
 ├── config.py                # Config loading (env + shipwright.yaml + plugins)
-├── sdk_patch.py             # Monkey-patch SDK for unknown message types
 ├── company/
 │   ├── company.py           # Company — manages employees, teams, work assignment
-│   ├── employee.py          # Employee — wraps a Claude Code SDK session
+│   ├── employee.py          # Employee — wraps a Claude Agent SDK session
 │   └── roles.py             # Built-in role definitions + plugin resolution
 ├── conversation/
 │   ├── session.py           # Conversation session — message history, context
@@ -55,12 +54,12 @@ shipwright/
 - **Company model**: Users hire individual employees with specific roles, optionally organize into teams
 - **Persistent employees**: Employees remember context across tasks via SDK session_id resume
 - **Team delegation**: Team leads coordinate members via delegation blocks (`[DELEGATE:member]...[/DELEGATE]`)
-- **Claude Code SDK**: All agent execution through `claude_code_sdk` — uses local subscription, no API costs
+- **Claude Agent SDK**: All agent execution through `claude_agent_sdk` — uses local subscription, no API costs
 - **Git worktree isolation**: All company work on an isolated branch
 - **Project discovery**: Auto-detects tech stack by scanning the repo
 - **Plugin system**: Custom roles and specialists via `crew.yaml` packages
 - **Cost tracking**: Per-employee cost/time tracking with optional budget limits (`BUDGET_LIMIT_USD`)
-- **SDK patch**: Monkey-patches `parse_message` to handle unknown types like `rate_limit_event` gracefully
+- **SDK types**: Uses `RateLimitEvent` from `claude_agent_sdk` to handle rate limits gracefully
 
 ## Built-in roles
 Individual roles that can be hired standalone or organized into teams:
@@ -109,7 +108,7 @@ Individual roles that can be hired standalone or organized into teams:
 - `TELEGRAM_BOT_TOKEN` / `DISCORD_BOT_TOKEN` — Bot tokens for chat interfaces
 
 ## Dependencies
-- `claude-code-sdk` — Claude Code SDK for agent execution
+- `claude-agent-sdk` — Claude Agent SDK for agent execution
 - `httpx` — HTTP client for Telegram bot
 - `python-dotenv` — .env file loading
 - `discord.py` — Discord bot (optional)

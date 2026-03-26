@@ -91,7 +91,7 @@ shipwright > talk Alex
 
 ### Persistent Employees
 
-Unlike fire-and-forget agents, Shipwright employees persist. Each employee maintains a Claude Code SDK session — they remember past tasks, conversations, and codebase context. The more an employee works, the more effective they become.
+Unlike fire-and-forget agents, Shipwright employees persist. Each employee maintains a Claude Agent SDK session — they remember past tasks, conversations, and codebase context. The more an employee works, the more effective they become.
 
 ```
 shipwright > assign Nori "Explore the codebase"
@@ -142,9 +142,9 @@ When work is assigned to a team, the lead breaks it into sub-tasks, delegates to
 
 Each role has a rich, senior-level system prompt with engineering philosophy, patterns, anti-patterns, and standards.
 
-### Claude Code SDK Integration
+### Claude Agent SDK Integration
 
-Every employee is a Claude Code SDK session. Shipwright uses your local Claude Code installation and existing subscription — no extra API costs. Employees get role-appropriate tools:
+Every employee is a Claude Agent SDK session. Shipwright uses your local Claude Code installation and existing subscription — no extra API costs. Employees get role-appropriate tools:
 
 - **Architects** get read-only tools (Read, Glob, Grep) for exploration
 - **Developers** get write tools (Read, Edit, Write, Bash) for implementation
@@ -248,7 +248,7 @@ Router (command parsing + dispatch)
  │
  ▼
 Company (employees, teams, work assignment)
- ├── Employee (wraps Claude Code SDK session)
+ ├── Employee (wraps Claude Agent SDK session)
  │     ├── Individual work (run tasks directly)
  │     └── Team lead work (delegate to members)
  └── Team (optional org structure)
@@ -262,10 +262,9 @@ Company (employees, teams, work assignment)
 shipwright/
 ├── main.py                  # CLI entry point, arg parsing
 ├── config.py                # Config loading (env + YAML + plugins)
-├── sdk_patch.py             # Monkey-patch SDK for unknown message types
 ├── company/
 │   ├── company.py           # Company — manages employees and teams
-│   ├── employee.py          # Employee — wraps Claude Code SDK session
+│   ├── employee.py          # Employee — wraps Claude Agent SDK session
 │   └── roles.py             # Built-in role definitions
 ├── conversation/
 │   ├── session.py           # Message history and conversation state
@@ -406,7 +405,7 @@ Create a `.env` file in your project root:
 # Model (default: claude-sonnet-4-6)
 SHIPWRIGHT_MODEL=claude-sonnet-4-6
 
-# Permission mode for Claude Code SDK (default: bypassPermissions)
+# Permission mode for Claude Agent SDK (default: bypassPermissions)
 SHIPWRIGHT_PERMISSION_MODE=bypassPermissions
 
 # Budget limit in USD (default: 0 = no limit)
