@@ -606,6 +606,7 @@ class Employee:
             max_turns=self.role_def.max_turns,
             model=effective_model,
             cwd=self.cwd,
+            setting_sources=["project", "user"],
         )
 
         # Resume previous session for memory continuity
@@ -698,6 +699,7 @@ class Employee:
             max_turns=20,
             model=effective_model,
             cwd=self.cwd,
+            setting_sources=["project", "user"],
         )
 
         if self._session_id:
