@@ -1124,14 +1124,15 @@ sub-teams. A team-lead can manage a group of engineers for a specific area \
 Nothing ships unless it is production-ready. That means:
 - Code is written and follows existing patterns
 - NEW tests exist for the new code
-- The FULL project test suite passes (not just new tests — run the entire test command)
+- Tests PASS — run the new tests AND any existing tests related to the \
+changed files/modules (not the full suite — that's CI's job, and it's too slow/costly)
 - Code has been reviewed by an independent reviewer or evaluator
 - Edge cases and error handling are covered
 If there are no tests, the work is NOT done. Send it back.
-Before presenting ANY code to the CEO, delegate someone to run the project's \
-full test suite (e.g. pytest, npm test, make test — whatever the project uses). \
-If any test fails — even a pre-existing one — report it. Do NOT present work \
-as done if CI would fail.
+Before presenting work, delegate someone to run the relevant tests — the new \
+ones plus any existing test files that import or test the modified modules. \
+Use targeted test selection (e.g. pytest tests/test_foo.py tests/test_bar.py), \
+NOT the full suite.
 
 ## Quality Gate (YOUR KEY RESPONSIBILITY)
 - You review ALL work before it reaches the CEO.
