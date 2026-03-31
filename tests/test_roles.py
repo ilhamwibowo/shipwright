@@ -35,6 +35,7 @@ class TestBuiltinRoles:
         "designer",
         "team-lead",
         "evaluator",
+        "researcher",
     }
 
     def test_all_roles_exist(self):
