@@ -222,8 +222,51 @@ class TestWorkAssignment:
         assert emp.task_history[0].status == "done"
         assert emp.status == EmployeeStatus.IDLE
 
+    @pytest.mark.asyncio
+    async def test_assign_work_emits_progress_before_employee_output(self, config: Config):
+        company = Company(config=config)
+        emp = company.hire("backend-dev", get_role_def("backend-dev"), name="Alex")
+        progress: list[str] = []
+
+        mock_result = MemberResult(
+            output="Done.",
+            session_id="s1",
+            total_cost_usd=0.01,
+        )
+
+        with patch.object(emp, "run", new_callable=AsyncMock, return_value=mock_result):
+            await company.assign_work(
+                "Alex",
+                "explore this codebase",
+                on_progress=progress.append,
+            )
+
+        assert progress
+        assert progress[0] == "Alex exploring the codebase..."
+
 
 class TestCTOFallbacks:
+    @pytest.mark.asyncio
+    async def test_cto_chat_emits_immediate_progress_for_exploration(self, config: Config):
+        company = Company(config=config)
+        cto = company.ensure_cto()
+        progress: list[str] = []
+
+        mock_result = MemberResult(
+            output="I inspected the repository and found the main modules.",
+            session_id="s1",
+        )
+
+        with patch.object(cto, "run", new_callable=AsyncMock, return_value=mock_result):
+            result = await company.cto_chat(
+                "explore this codebase",
+                on_progress=progress.append,
+            )
+
+        assert result
+        assert progress
+        assert progress[0] == "CTO exploring the codebase..."
+
     @pytest.mark.asyncio
     async def test_cto_chat_casual_failure_falls_back_cleanly(self, config: Config):
         company = Company(config=config)

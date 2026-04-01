@@ -245,6 +245,7 @@ class Router:
         on_delegation_start: Callable[[str, str, int, int], None] | None = None,
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
     ) -> str:
         """Process a user message and return the response.
 
@@ -301,6 +302,7 @@ class Router:
                 on_delegation_start=on_delegation_start,
                 on_delegation_end=on_delegation_end,
                 on_progress=on_progress,
+                on_checkpoint=on_checkpoint,
             )
             self.session.add_system_message(response)
             return response
@@ -322,6 +324,7 @@ class Router:
                     on_delegation_start=on_delegation_start,
                     on_delegation_end=on_delegation_end,
                     on_progress=on_progress,
+                    on_checkpoint=on_checkpoint,
                 )
                 self.session.add_lead_message(response, crew_id=resolved)
                 return response
@@ -392,6 +395,7 @@ class Router:
                     on_delegation_start=on_delegation_start,
                     on_delegation_end=on_delegation_end,
                     on_progress=on_progress,
+                    on_checkpoint=on_checkpoint,
                 )
                 self.session.add_lead_message(response, crew_id=resolved)
                 return response
@@ -417,6 +421,7 @@ class Router:
                 on_delegation_start=on_delegation_start,
                 on_delegation_end=on_delegation_end,
                 on_progress=on_progress,
+                on_checkpoint=on_checkpoint,
             )
             if response:
                 self.session.add_system_message(response)
@@ -463,6 +468,7 @@ class Router:
                     on_delegation_start=on_delegation_start,
                     on_delegation_end=on_delegation_end,
                     on_progress=on_progress,
+                    on_checkpoint=on_checkpoint,
                 )
             else:
                 # Direct conversation with active employee
@@ -473,6 +479,7 @@ class Router:
                     on_delegation_start=on_delegation_start,
                     on_delegation_end=on_delegation_end,
                     on_progress=on_progress,
+                    on_checkpoint=on_checkpoint,
                 )
             self.session.add_lead_message(response, crew_id=employee.name)
             return response
@@ -1349,6 +1356,7 @@ class Router:
         on_delegation_start: Callable[[str, str, int, int], None] | None = None,
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
     ) -> str:
         """Resume a paused/interrupted roadmap. Only called for explicit resume intent."""
         roadmap = self.company.active_roadmap
@@ -1364,6 +1372,7 @@ class Router:
                     on_delegation_start=on_delegation_start,
                     on_delegation_end=on_delegation_end,
                     on_progress=on_progress,
+                    on_checkpoint=on_checkpoint,
                 ) or "No roadmap to resume."
             return "Roadmap is already running."
 
@@ -1381,6 +1390,7 @@ class Router:
             on_delegation_start=on_delegation_start,
             on_delegation_end=on_delegation_end,
             on_progress=on_progress,
+            on_checkpoint=on_checkpoint,
         )
         return result
 
@@ -1434,6 +1444,10 @@ class Router:
             lines.append(f"  {icon} {t.index}. {t.description}{suffix}")
             if t.output_summary:
                 lines.append(f"       {t.output_summary[:70]}")
+            elif getattr(t, "last_error", "") and t.status == RoadmapTaskStatus.FAILED:
+                lines.append(f"       Last error: {t.last_error[:70]}")
+            if getattr(t, "attempts", 0) > 1:
+                lines.append(f"       Attempts: {t.attempts}")
 
         lines.append(f"  {'\u2500' * 48}")
 
@@ -1452,6 +1466,7 @@ class Router:
         on_delegation_start: Callable[[str, str, int, int], None] | None = None,
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
     ) -> str | None:
         """Approve and start executing the active roadmap. Returns None if no roadmap."""
         roadmap = self.company.active_roadmap
@@ -1469,6 +1484,7 @@ class Router:
             on_delegation_start=on_delegation_start,
             on_delegation_end=on_delegation_end,
             on_progress=on_progress,
+            on_checkpoint=on_checkpoint,
         )
         return result
 

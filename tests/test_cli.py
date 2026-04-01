@@ -4,6 +4,7 @@ import time
 
 from shipwright.interfaces.cli import (
     BOLD,
+    BR_WHITE,
     CYAN,
     DIM,
     GREEN,
@@ -113,11 +114,11 @@ class TestCLIOutput:
         ui.on_text("hello")
         assert ui.streamed is True
 
-    def test_on_text_prints_cyan(self, capsys):
+    def test_on_text_prints_high_contrast(self, capsys):
         ui = CLIOutput()
         ui.on_text("hello")
         captured = capsys.readouterr()
-        assert CYAN in captured.out
+        assert BR_WHITE in captured.out
         assert "hello" in captured.out
 
     def test_on_text_prints_speaker_label(self, capsys):

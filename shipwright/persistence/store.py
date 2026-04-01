@@ -6,8 +6,10 @@ Each session gets its own state file: ~/.shipwright/sessions/<name>.json
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 
 from shipwright.config import Config
@@ -15,8 +17,34 @@ from shipwright.config import Config
 logger = logging.getLogger("shipwright.persistence")
 
 
+_DEFAULT_SESSION = "default"
+_DEFAULT_PREFIX = "default__"
+
+
+def _slugify_workspace_name(name: str) -> str:
+    """Build a stable, filesystem-safe workspace label."""
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", name.strip()).strip("-").lower()
+    return slug or "workspace"
+
+
+def _storage_session_id(config: Config, session_id: str) -> str:
+    """Map the user-facing session name to a storage key.
+
+    `default` is scoped by repo root so different workspaces do not share the
+    same state file accidentally.
+    """
+    if session_id != _DEFAULT_SESSION:
+        return session_id
+
+    repo_root = str(config.repo_root.resolve())
+    digest = hashlib.sha1(repo_root.encode("utf-8")).hexdigest()[:10]
+    slug = _slugify_workspace_name(config.repo_root.name)
+    return f"{_DEFAULT_PREFIX}{slug}__{digest}"
+
+
 def _state_path(config: Config, session_id: str) -> Path:
-    return config.sessions_dir / f"{session_id}.json"
+    storage_id = _storage_session_id(config, session_id)
+    return config.sessions_dir / f"{storage_id}.json"
 
 
 def save_state(data: dict, config: Config, session_id: str = "default") -> None:
@@ -70,6 +98,15 @@ def list_sessions(config: Config) -> list[str]:
     """List all saved session IDs."""
     if not config.sessions_dir.exists():
         return []
-    return [
-        p.stem for p in config.sessions_dir.glob("*.json")
-    ]
+
+    current_default = _storage_session_id(config, _DEFAULT_SESSION)
+    sessions: list[str] = []
+    for path in config.sessions_dir.glob("*.json"):
+        stem = path.stem
+        if stem == current_default:
+            sessions.append(_DEFAULT_SESSION)
+            continue
+        if stem.startswith(_DEFAULT_PREFIX):
+            continue
+        sessions.append(stem)
+    return sorted(set(sessions))

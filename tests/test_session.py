@@ -1,6 +1,7 @@
 """Tests for session management, round-trip persistence, and named sessions (V2)."""
 
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
@@ -191,6 +192,19 @@ class TestNamedSessions:
         session = Session(id="test")
         router = Router(config=config, session=session)
         assert router.session_name == "default"
+
+    def test_default_session_storage_is_workspace_scoped(self, config: Config, tmp_path: Path):
+        session = Session(id="default")
+        router = Router(config=config, session=session, session_name="default")
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
+        save_state(router.to_dict(), config, session_id="default")
+
+        other_repo = tmp_path / "other-workspace"
+        other_repo.mkdir()
+        other_config = replace(config, repo_root=other_repo)
+
+        assert load_state(config, session_id="default") is not None
+        assert load_state(other_config, session_id="default") is None
 
     def test_list_sessions_shows_all(self, config: Config):
         save_state({"a": 1}, config, session_id="alpha")

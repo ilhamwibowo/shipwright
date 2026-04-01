@@ -52,16 +52,24 @@ class RoadmapTask:
     index: int  # 1-based position
     description: str
     status: RoadmapTaskStatus = RoadmapTaskStatus.PENDING
+    attempts: int = 0
     output_summary: str = ""
     handoff_artifact: str = ""  # path or content from handoff
+    last_error: str = ""
+    last_started_at: float | None = None
+    last_updated_at: float | None = None
 
     def to_dict(self) -> dict:
         return {
             "index": self.index,
             "description": self.description,
             "status": self.status.value,
+            "attempts": self.attempts,
             "output_summary": self.output_summary[:2000],
             "handoff_artifact": self.handoff_artifact[:3000],
+            "last_error": self.last_error[:500],
+            "last_started_at": self.last_started_at,
+            "last_updated_at": self.last_updated_at,
         }
 
     @classmethod
@@ -70,8 +78,12 @@ class RoadmapTask:
             index=data["index"],
             description=data["description"],
             status=RoadmapTaskStatus(data.get("status", "pending")),
+            attempts=int(data.get("attempts", 0)),
             output_summary=data.get("output_summary", ""),
             handoff_artifact=data.get("handoff_artifact", ""),
+            last_error=data.get("last_error", ""),
+            last_started_at=data.get("last_started_at"),
+            last_updated_at=data.get("last_updated_at"),
         )
 
 
@@ -163,9 +175,13 @@ class Roadmap:
             elif t.status == RoadmapTaskStatus.PENDING and self.state == RoadmapState.INTERRUPTED:
                 if t.index == (self.current_task_index or 0):
                     suffix = "  ← interrupted here"
+            if t.attempts > 1:
+                suffix += f"  ({t.attempts} attempts)"
             lines.append(f"  {icon} {t.index}. {t.description}{suffix}")
             if t.output_summary:
                 lines.append(f"       {t.output_summary[:80]}")
+            elif t.last_error and t.status == RoadmapTaskStatus.FAILED:
+                lines.append(f"       Last error: {t.last_error[:80]}")
         lines.append(f"  {'─' * 48}")
         if self.state == RoadmapState.PAUSED:
             lines.append("\n  *Paused* — type `continue` or `resume` to pick up where you left off.")
@@ -631,6 +647,25 @@ class Employee:
             return artifact_path.read_text()
         return ""
 
+    def _should_retry_fresh_session(
+        self,
+        error: Exception,
+        *,
+        resumed_session_id: str | None,
+        collected_text: list[str],
+        num_turns: int,
+    ) -> bool:
+        """Detect when a persisted remote session is gone and we should retry fresh."""
+        if not resumed_session_id or collected_text or num_turns > 0:
+            return False
+
+        message = str(error).lower()
+        return (
+            "command failed with exit code 1" in message
+            or "no conversation found with session id" in message
+            or "cannot resume" in message
+        )
+
     async def run(
         self,
         task: str,
@@ -677,37 +712,58 @@ class Employee:
             self.name, self.role_def.role, effective_model, self.cwd,
         )
 
-        collected_text: list[str] = []
-        result = MemberResult(output="")
+        retried_fresh = False
+        while True:
+            collected_text = []
+            result = MemberResult(output="")
+            resumed_session_id = self._session_id
 
-        try:
-            async for message in query(prompt=prompt, options=options):
-                if isinstance(message, RateLimitEvent):
-                    logger.debug("[%s] Rate limited, retrying in %ss", self.name, getattr(message, "retry_after", "?"))
+            try:
+                async for message in query(prompt=prompt, options=options):
+                    if isinstance(message, RateLimitEvent):
+                        logger.debug("[%s] Rate limited, retrying in %ss", self.name, getattr(message, "retry_after", "?"))
+                        continue
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                collected_text.append(block.text)
+                                if on_text:
+                                    on_text(block.text)
+                            elif isinstance(block, ThinkingBlock):
+                                logger.debug("[%s] Thinking: %s", self.name, block.thinking[:100])
+                            elif isinstance(block, ToolUseBlock):
+                                logger.debug("[%s] Tool use: %s", self.name, block.name)
+                    elif isinstance(message, ResultMessage):
+                        result.session_id = getattr(message, "session_id", "")
+                        result.num_turns = getattr(message, "num_turns", 0)
+                        result.duration_ms = getattr(message, "duration_ms", 0)
+                        result.is_error = getattr(message, "is_error", False)
+                        result.total_cost_usd = getattr(message, "total_cost_usd", 0.0) or 0.0
+                        self._session_id = result.session_id or self._session_id
+                        if not collected_text and getattr(message, "result", None):
+                            collected_text.append(message.result)
+                break
+            except Exception as exc:
+                if not retried_fresh and self._should_retry_fresh_session(
+                    exc,
+                    resumed_session_id=resumed_session_id,
+                    collected_text=collected_text,
+                    num_turns=result.num_turns,
+                ):
+                    logger.warning(
+                        "[%s] Stored session %s is no longer resumable; retrying fresh",
+                        self.name,
+                        resumed_session_id,
+                    )
+                    self._session_id = None
+                    options.resume = None
+                    retried_fresh = True
                     continue
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            collected_text.append(block.text)
-                            if on_text:
-                                on_text(block.text)
-                        elif isinstance(block, ThinkingBlock):
-                            logger.debug("[%s] Thinking: %s", self.name, block.thinking[:100])
-                        elif isinstance(block, ToolUseBlock):
-                            logger.debug("[%s] Tool use: %s", self.name, block.name)
-                elif isinstance(message, ResultMessage):
-                    result.session_id = getattr(message, "session_id", "")
-                    result.num_turns = getattr(message, "num_turns", 0)
-                    result.duration_ms = getattr(message, "duration_ms", 0)
-                    result.is_error = getattr(message, "is_error", False)
-                    result.total_cost_usd = getattr(message, "total_cost_usd", 0.0) or 0.0
-                    self._session_id = result.session_id or self._session_id
-                    if not collected_text and getattr(message, "result", None):
-                        collected_text.append(message.result)
-        except Exception as exc:
-            logger.error("[%s] Failed: %s", self.name, exc)
-            result.is_error = True
-            collected_text.append(f"Error: {exc}")
+
+                logger.error("[%s] Failed: %s", self.name, exc)
+                result.is_error = True
+                collected_text.append(f"Error: {exc}")
+                break
 
         result.output = "\n".join(collected_text)
         self.cost_total_usd += result.total_cost_usd
@@ -766,28 +822,49 @@ class Employee:
 
         logger.info("[%s/lead] Processing: %s", self.name, user_message[:80])
 
-        collected_text: list[str] = []
-        response = LeadResponse(text="")
+        retried_fresh = False
+        while True:
+            collected_text = []
+            response = LeadResponse(text="")
+            resumed_session_id = self._session_id
 
-        try:
-            async for message in query(prompt=prompt, options=options):
-                if isinstance(message, RateLimitEvent):
-                    logger.debug("[%s/lead] Rate limited, retrying in %ss", self.name, getattr(message, "retry_after", "?"))
+            try:
+                async for message in query(prompt=prompt, options=options):
+                    if isinstance(message, RateLimitEvent):
+                        logger.debug("[%s/lead] Rate limited, retrying in %ss", self.name, getattr(message, "retry_after", "?"))
+                        continue
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                collected_text.append(block.text)
+                                if on_text:
+                                    on_text(block.text)
+                    elif isinstance(message, ResultMessage):
+                        response.session_id = getattr(message, "session_id", "")
+                        self._session_id = response.session_id or self._session_id
+                        if not collected_text and getattr(message, "result", None):
+                            collected_text.append(message.result)
+                break
+            except Exception as exc:
+                if not retried_fresh and self._should_retry_fresh_session(
+                    exc,
+                    resumed_session_id=resumed_session_id,
+                    collected_text=collected_text,
+                    num_turns=0,
+                ):
+                    logger.warning(
+                        "[%s/lead] Stored session %s is no longer resumable; retrying fresh",
+                        self.name,
+                        resumed_session_id,
+                    )
+                    self._session_id = None
+                    options.resume = None
+                    retried_fresh = True
                     continue
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            collected_text.append(block.text)
-                            if on_text:
-                                on_text(block.text)
-                elif isinstance(message, ResultMessage):
-                    response.session_id = getattr(message, "session_id", "")
-                    self._session_id = response.session_id or self._session_id
-                    if not collected_text and getattr(message, "result", None):
-                        collected_text.append(message.result)
-        except Exception as exc:
-            logger.error("[%s/lead] Error: %s", self.name, exc)
-            collected_text.append(f"I encountered an error: {exc}")
+
+                logger.error("[%s/lead] Error: %s", self.name, exc)
+                collected_text.append(f"I encountered an error: {exc}")
+                break
 
         full_text = "\n".join(collected_text)
         response.text = full_text

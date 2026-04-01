@@ -1,8 +1,10 @@
 """Tests for the V2 Employee module: Employee, Task, delegation parsing, name pool, CTO parsing."""
 
 import time
+from unittest.mock import patch
 
 import pytest
+from claude_agent_sdk import AssistantMessage, ResultMessage, TextBlock
 
 from shipwright.config import MemberDef
 from shipwright.company.employee import (
@@ -129,6 +131,38 @@ class TestEmployee:
         # Modifying the returned list shouldn't affect internal state
         history.clear()
         assert len(emp._conversation) == 1
+
+    @pytest.mark.asyncio
+    async def test_run_retries_with_fresh_session_when_resume_is_stale(self):
+        emp = self._make_employee()
+        emp._session_id = "dead-session"
+        seen_resumes: list[str | None] = []
+
+        async def fake_query(prompt, options):
+            seen_resumes.append(options.resume)
+            if options.resume == "dead-session":
+                raise RuntimeError("Command failed with exit code 1 (exit code: 1)")
+            yield AssistantMessage(
+                content=[TextBlock("Fresh session worked.")],
+                model="claude-sonnet-4-6",
+            )
+            yield ResultMessage(
+                subtype="success",
+                duration_ms=10,
+                duration_api_ms=10,
+                is_error=False,
+                num_turns=1,
+                session_id="new-session",
+                result="Fresh session worked.",
+            )
+
+        with patch("shipwright.company.employee.query", side_effect=fake_query):
+            result = await emp.run("Explore the codebase")
+
+        assert result.output == "Fresh session worked."
+        assert result.is_error is False
+        assert seen_resumes == ["dead-session", None]
+        assert emp.session_id == "new-session"
 
 
 # ---------------------------------------------------------------------------

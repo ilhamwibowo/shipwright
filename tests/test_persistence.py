@@ -1,6 +1,7 @@
 """Tests for state persistence."""
 
 from pathlib import Path
+from dataclasses import replace
 
 import pytest
 
@@ -60,3 +61,28 @@ class TestPersistence:
         save_state({"test": True}, config, session_id="test")
         tmp_files = list(config.sessions_dir.glob("*.tmp"))
         assert len(tmp_files) == 0
+
+    def test_default_session_is_workspace_scoped(self, config: Config, tmp_path: Path):
+        other_repo = tmp_path / "other-repo"
+        other_repo.mkdir()
+        other_config = replace(config, repo_root=other_repo)
+
+        save_state({"workspace": "primary"}, config, session_id="default")
+
+        assert load_state(config, session_id="default") == {"workspace": "primary"}
+        assert load_state(other_config, session_id="default") is None
+
+    def test_list_sessions_hides_other_workspaces_default(self, config: Config, tmp_path: Path):
+        other_repo = tmp_path / "other-repo"
+        other_repo.mkdir()
+        other_config = replace(config, repo_root=other_repo)
+
+        save_state({"workspace": "primary"}, config, session_id="default")
+        save_state({"workspace": "other"}, other_config, session_id="default")
+        save_state({"named": True}, config, session_id="alpha")
+
+        sessions = list_sessions(config)
+
+        assert "default" in sessions
+        assert "alpha" in sessions
+        assert len([name for name in sessions if name == "default"]) == 1

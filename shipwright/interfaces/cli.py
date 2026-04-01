@@ -698,7 +698,7 @@ class CLIOutput:
     # -- callbacks ----------------------------------------------------------
 
     def on_text(self, text: str) -> None:
-        """Stream lead text — stops spinner on first chunk, prints in cyan."""
+        """Stream lead text — stops spinner on first chunk, prints high-contrast."""
         if self.spinner.active:
             self.spinner.stop()
         if not self._got_text:
@@ -706,10 +706,10 @@ class CLIOutput:
             if self._speaker_label:
                 color = role_color(self._speaker_role or "cto")
                 sys.stdout.write(
-                    f"\n  {color}[{self._speaker_label}]{RESET} {CYAN}"
+                    f"\n  {color}[{self._speaker_label}]{RESET} {BR_WHITE}"
                 )
             else:
-                sys.stdout.write(f"\n  {CYAN}")
+                sys.stdout.write(f"\n  {BR_WHITE}")
         sys.stdout.write(text)
         sys.stdout.flush()
 
@@ -1144,6 +1144,9 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
         router._log_event("fail" if err else "done", name, _format_elapsed(dur))
         ui.on_delegation_end(name, dur, err)
 
+    def _checkpoint():
+        save_state(router.to_dict(), config, session_id=router.session_name)
+
     while True:
         try:
             strip = _render_status_strip(router)
@@ -1172,6 +1175,7 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
                     on_delegation_start=_on_deleg_start,
                     on_delegation_end=_on_deleg_end,
                     on_progress=ui.on_progress,
+                    on_checkpoint=_checkpoint,
                 )
 
                 ui.finish_response()
@@ -1273,6 +1277,9 @@ async def run_oneshot(
         router._log_event("fail" if err else "done", name, _format_elapsed(dur))
         ui.on_delegation_end(name, dur, err)
 
+    def _checkpoint():
+        save_state(router.to_dict(), config, session_id=router.session_name)
+
     speaker_label, speaker_role = _response_identity(router, message)
     ui.start_thinking(speaker_label=speaker_label, speaker_role=speaker_role)
 
@@ -1282,6 +1289,7 @@ async def run_oneshot(
         on_delegation_start=_on_deleg_start,
         on_delegation_end=_on_deleg_end,
         on_progress=ui.on_progress,
+        on_checkpoint=_checkpoint,
     )
 
     ui.finish_response()

@@ -196,6 +196,27 @@ def _casual_fallback_response(message: str) -> str:
     return "I'm here. What do you need built?"
 
 
+def _progress_hint(actor_name: str, task: str) -> str:
+    """Return a human progress line before a long-running agent call starts."""
+    lower = re.sub(r"\s+", " ", task.lower().strip())
+
+    if any(token in lower for token in (
+        "explore", "inspect", "understand", "read the repo", "read this repo",
+        "explore this repo", "explore this codebase", "inspect this codebase",
+        "codebase", "repository", "repo",
+    )):
+        return f"{actor_name} exploring the codebase..."
+    if any(token in lower for token in ("review", "audit", "analyze", "analyse")):
+        return f"{actor_name} reviewing the work..."
+    if any(token in lower for token in ("plan", "roadmap", "break this down")):
+        return f"{actor_name} planning the approach..."
+    if any(token in lower for token in ("fix", "debug", "investigate")):
+        return f"{actor_name} investigating the issue..."
+    if any(token in lower for token in ("build", "implement", "add", "create")):
+        return f"{actor_name} scoping the implementation..."
+    return f"{actor_name} working..."
+
+
 @dataclass
 class Team:
     """A team of employees with an optional lead."""
@@ -257,6 +278,17 @@ class Company:
     @property
     def active_employee_is_explicit(self) -> bool:
         return self._active_employee_explicit
+
+    def _run_checkpoint(
+        self, on_checkpoint: Callable[[], None] | None,
+    ) -> None:
+        """Persist current state opportunistically without breaking execution."""
+        if not on_checkpoint:
+            return
+        try:
+            on_checkpoint()
+        except Exception as exc:
+            logger.warning("Checkpoint callback failed: %s", exc)
 
     def hire(
         self,
@@ -623,6 +655,7 @@ class Company:
         on_delegation_start: Callable[[str, str, int, int], None] | None = None,
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
     ) -> str:
         """Full CTO flow: respond → hire → delegate → review → present.
 
@@ -646,6 +679,8 @@ class Company:
 
         # Step 1: CTO responds to the user's message (streamed)
         try:
+            if on_progress:
+                on_progress(_progress_hint("CTO", message))
             result = await cto.run(
                 task=message,
                 system_prompt=system_prompt,
@@ -681,6 +716,7 @@ class Company:
         if roadmap:
             roadmap.original_request = message
             self.active_roadmap = roadmap
+            self._run_checkpoint(on_checkpoint)
             # Return CTO's commentary + the roadmap for user approval
             parts = []
             if response_text:
@@ -701,6 +737,7 @@ class Company:
                 on_delegation_start=on_delegation_start,
                 on_delegation_end=on_delegation_end,
                 on_progress=on_progress,
+                on_checkpoint=on_checkpoint,
             )
             parts = []
             if response_text:
@@ -712,6 +749,8 @@ class Company:
         response_text, hires = parse_hire_blocks(response_text)
         hires = self._filter_hires(cto, hires)
         hire_messages = self._process_hires(hires)
+        if hire_messages:
+            self._run_checkpoint(on_checkpoint)
 
         response_text, delegations = parse_delegations(response_text)
         delegations = self._filter_delegations(cto, delegations)
@@ -734,6 +773,7 @@ class Company:
             on_delegation_start=on_delegation_start,
             on_delegation_end=on_delegation_end,
             on_progress=on_progress,
+            on_checkpoint=on_checkpoint,
         )
 
         # Combine all parts
@@ -753,6 +793,7 @@ class Company:
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
         on_roadmap_task_complete: Callable[[int, int, str], None] | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
     ) -> str:
         """Execute the active roadmap task by task.
 
@@ -778,6 +819,7 @@ class Company:
         roadmap.paused = False
         roadmap.state = RoadmapState.RUNNING
         collected_reports: list[str] = []
+        self._run_checkpoint(on_checkpoint)
 
         while True:
             idx = roadmap.current_task_index
@@ -785,12 +827,6 @@ class Company:
                 break  # All tasks done
 
             task = roadmap.tasks[idx - 1]  # convert 1-based to 0-based
-            task.status = RoadmapTaskStatus.RUNNING
-
-            if on_progress:
-                on_progress(
-                    f"Roadmap task {idx}/{roadmap.total_count}: {task.description}"
-                )
 
             # Build context for this task
             context_parts = [
@@ -815,12 +851,29 @@ class Company:
             if budget > 0 and self.total_cost >= budget:
                 task.status = RoadmapTaskStatus.FAILED
                 task.output_summary = "Budget exceeded"
+                task.last_error = "Budget exceeded"
+                task.last_updated_at = time.time()
                 roadmap.paused = True
                 roadmap.state = RoadmapState.PAUSED
+                self._run_checkpoint(on_checkpoint)
                 collected_reports.append(
                     f"Task {idx}/{roadmap.total_count} **paused**: Budget exceeded."
                 )
                 break
+
+            now = time.time()
+            task.attempts += 1
+            task.status = RoadmapTaskStatus.RUNNING
+            task.last_started_at = now
+            task.last_updated_at = now
+            task.last_error = ""
+            self._run_checkpoint(on_checkpoint)
+
+            if on_progress:
+                on_progress(
+                    f"Roadmap task {idx}/{roadmap.total_count}: {task.description}"
+                    f" (attempt {task.attempts}/{self.config.max_roadmap_task_retries + 1})"
+                )
 
             # Execute via the normal CTO flow (without recursing into roadmap)
             try:
@@ -852,6 +905,7 @@ class Company:
                         on_delegation_start=on_delegation_start,
                         on_delegation_end=on_delegation_end,
                         on_progress=on_progress,
+                        on_checkpoint=on_checkpoint,
                     )
                     response_text = (
                         f"{response_text}\n\n{loop_result}" if loop_result else response_text
@@ -862,6 +916,8 @@ class Company:
                 # Build summary from first 200 chars of response
                 summary_line = response_text.strip().split("\n")[0][:200] if response_text else "Done"
                 task.output_summary = summary_line
+                task.last_error = ""
+                task.last_updated_at = time.time()
 
                 # Context reset the CTO to stay fresh
                 artifact_path = cto.save_handoff_artifact(
@@ -872,11 +928,14 @@ class Company:
                 cto._session_id = None
                 cto._conversation.clear()
                 cto._cumulative_turns = 0
+                self._run_checkpoint(on_checkpoint)
 
                 report = (
                     f"Task {idx}/{roadmap.total_count} done: "
                     f"{task.description}"
                 )
+                if task.attempts > 1:
+                    report += f" after {task.attempts} attempts"
                 collected_reports.append(report)
 
                 if on_roadmap_task_complete:
@@ -892,8 +951,10 @@ class Company:
             except asyncio.CancelledError:
                 # Ctrl+C / cancellation — interrupted
                 task.status = RoadmapTaskStatus.PENDING
+                task.last_updated_at = time.time()
                 roadmap.paused = True
                 roadmap.state = RoadmapState.INTERRUPTED
+                self._run_checkpoint(on_checkpoint)
                 collected_reports.append(
                     f"Task {idx}/{roadmap.total_count} **interrupted**. "
                     "Type `continue` to resume."
@@ -902,12 +963,32 @@ class Company:
 
             except Exception as exc:
                 logger.error("Roadmap task %d failed: %s", idx, exc)
+                task.last_error = str(exc)[:500]
+                task.last_updated_at = time.time()
+
+                if task.attempts <= self.config.max_roadmap_task_retries:
+                    next_attempt = task.attempts + 1
+                    total_attempts = self.config.max_roadmap_task_retries + 1
+                    task.status = RoadmapTaskStatus.PENDING
+                    task.output_summary = (
+                        f"Retrying after error: {exc}"
+                    )[:2000]
+                    self._run_checkpoint(on_checkpoint)
+                    if on_progress:
+                        on_progress(
+                            f"Roadmap task {idx}/{roadmap.total_count} hit an error; "
+                            f"retrying attempt {next_attempt}/{total_attempts}."
+                        )
+                    continue
+
                 task.status = RoadmapTaskStatus.FAILED
                 task.output_summary = f"Error: {exc}"
                 roadmap.paused = True
                 roadmap.state = RoadmapState.PAUSED
+                self._run_checkpoint(on_checkpoint)
                 collected_reports.append(
-                    f"Task {idx}/{roadmap.total_count} **failed**: {exc}\n"
+                    f"Task {idx}/{roadmap.total_count} **failed** after "
+                    f"{task.attempts} attempts: {exc}\n"
                     "Roadmap paused. Fix the issue and type `continue` to retry, "
                     "or modify the roadmap."
                 )
@@ -916,11 +997,13 @@ class Company:
         # Final summary
         if roadmap.is_complete:
             roadmap.state = RoadmapState.COMPLETE
+            self._run_checkpoint(on_checkpoint)
             collected_reports.append(
                 f"\n**Roadmap complete!** All {roadmap.total_count} tasks done."
             )
             # Clear the roadmap
             self.active_roadmap = None
+            self._run_checkpoint(on_checkpoint)
 
         return "\n".join(collected_reports)
 
@@ -947,6 +1030,8 @@ class Company:
         context_chain: list[str] | None = None,
         on_delegation_start: Callable[[str, str, int, int], None] | None = None,
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
     ) -> str:
         """Execute delegations. Routes team-leads through their team delegation loop."""
         results_parts = []
@@ -969,12 +1054,16 @@ class Company:
             if emp.is_lead and emp.team and emp.team in self.teams:
                 output = await self._assign_to_team(
                     emp.team, d.task, context_chain=context_chain,
+                    on_progress=on_progress,
+                    on_checkpoint=on_checkpoint,
                 )
                 # Team delegation loop handles errors internally
                 is_error = False
             else:
                 output = await self._assign_to_employee(
                     d.member_name, d.task, context_chain=context_chain,
+                    on_progress=on_progress,
+                    on_checkpoint=on_checkpoint,
                 )
                 is_error = (
                     emp.task_history and emp.task_history[-1].status == "failed"
@@ -1044,6 +1133,7 @@ class Company:
         on_delegation_start: Callable[[str, str, int, int], None] | None = None,
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
         max_rounds: int | None = None,
     ) -> str:
         """Shared delegation loop for CTO and team-leads.
@@ -1073,6 +1163,8 @@ class Company:
                     coordinator, pending_delegations, context_chain=chain,
                     on_delegation_start=on_delegation_start,
                     on_delegation_end=on_delegation_end,
+                    on_progress=on_progress,
+                    on_checkpoint=on_checkpoint,
                 )
                 results_parts.append(del_results)
 
@@ -1095,10 +1187,13 @@ class Company:
                 if emp.is_lead and emp.team and emp.team in self.teams:
                     output = await self._assign_to_team(
                         emp.team, feedback_task, context_chain=chain,
+                        on_checkpoint=on_checkpoint,
                     )
                 else:
                     output = await self._assign_to_employee(
                         rev.employee_name, feedback_task, context_chain=chain,
+                        on_progress=on_progress,
+                        on_checkpoint=on_checkpoint,
                     )
                 truncated = output[:5000]
                 if len(output) > 5000:
@@ -1133,6 +1228,7 @@ class Company:
             if hires:
                 hire_msgs = self._process_hires(hires)
                 collected_output.extend(hire_msgs)
+                self._run_checkpoint(on_checkpoint)
 
             if not pending_revisions and not pending_delegations:
                 # Coordinator approved the results
@@ -1161,6 +1257,7 @@ class Company:
         on_delegation_start: Callable[[str, str, int, int], None] | None = None,
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
     ) -> str:
         """Assign work to an employee or team.
 
@@ -1179,6 +1276,8 @@ class Company:
         if target in self.employees:
             return await self._assign_to_employee(
                 target, task_description, on_text=on_text,
+                on_progress=on_progress,
+                on_checkpoint=on_checkpoint,
             )
         elif target in self.teams:
             return await self._assign_to_team(
@@ -1187,6 +1286,7 @@ class Company:
                 on_delegation_start=on_delegation_start,
                 on_delegation_end=on_delegation_end,
                 on_progress=on_progress,
+                on_checkpoint=on_checkpoint,
             )
         else:
             raise ValueError(f"No employee or team named '{target}'.")
@@ -1197,6 +1297,8 @@ class Company:
         task_description: str,
         on_text: Callable[[str], None] | None = None,
         context_chain: list[str] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
     ) -> str:
         """Assign work directly to an employee."""
         employee = self.employees[employee_name]
@@ -1209,6 +1311,9 @@ class Company:
         task.status = "running"
         employee.current_task = task
         employee.status = EmployeeStatus.WORKING
+        self._run_checkpoint(on_checkpoint)
+        if on_progress:
+            on_progress(_progress_hint(employee.name, task_description))
 
         # Build context with upstream delegation chain
         context_parts = []
@@ -1250,6 +1355,7 @@ class Company:
             employee.task_history.append(task)
             employee.current_task = None
             employee.status = EmployeeStatus.IDLE
+            self._run_checkpoint(on_checkpoint)
 
         return result.output
 
@@ -1262,6 +1368,7 @@ class Company:
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
         context_chain: list[str] | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
     ) -> str:
         """Assign work to a team — the lead coordinates via delegation loop."""
         team = self.teams[team_name]
@@ -1282,6 +1389,9 @@ class Company:
             chain_str = "\n".join(context_chain)
             full_task = f"{chain_str}\n\nTask: {task_description}"
 
+        if on_progress:
+            on_progress(_progress_hint(lead.name, task_description))
+
         # Initial lead response
         response = await lead.respond_as_lead(
             user_message=full_task,
@@ -1290,6 +1400,7 @@ class Company:
             project_context=self.project_context,
             on_text=on_text,
         )
+        self._run_checkpoint(on_checkpoint)
 
         clean_text, delegations = parse_delegations(response.text)
         # Hierarchy enforcement: team-lead scoped to team
@@ -1312,6 +1423,7 @@ class Company:
             on_delegation_start=on_delegation_start,
             on_delegation_end=on_delegation_end,
             on_progress=on_progress,
+            on_checkpoint=on_checkpoint,
         )
 
         if loop_result:
@@ -1327,6 +1439,7 @@ class Company:
         on_delegation_start: Callable[[str, str, int, int], None] | None = None,
         on_delegation_end: Callable[[str, float, bool], None] | None = None,
         on_progress: Callable[[str], None] | None = None,
+        on_checkpoint: Callable[[], None] | None = None,
     ) -> str:
         """Talk to an employee. If they're a team lead, uses delegation mode."""
         if employee_name not in self.employees:
@@ -1342,9 +1455,12 @@ class Company:
                 on_delegation_start=on_delegation_start,
                 on_delegation_end=on_delegation_end,
                 on_progress=on_progress,
+                on_checkpoint=on_checkpoint,
             )
         else:
             # Individual contributor — direct conversation
+            if on_progress:
+                on_progress(_progress_hint(employee.name, message))
             result = await employee.run(
                 task=message,
                 context=self.project_context,
@@ -1353,6 +1469,7 @@ class Company:
             # Track conversation
             employee._conversation.append({"role": "user", "text": message})
             employee._conversation.append({"role": "employee", "text": result.output})
+            self._run_checkpoint(on_checkpoint)
             return result.output
 
     def setup_worktree(self) -> Path:

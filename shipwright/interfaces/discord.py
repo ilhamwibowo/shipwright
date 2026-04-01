@@ -99,7 +99,10 @@ class ShipwrightBot(discord.Client):
 
         async with message.channel.typing():
             router = self._get_router(message.channel.id)
-            response = await router.handle_message(text)
+            response = await router.handle_message(
+                text,
+                on_checkpoint=lambda: self._save_router(message.channel.id),
+            )
             if response:
                 await self._send(message.channel, response)
             self._save_router(message.channel.id)

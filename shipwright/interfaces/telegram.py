@@ -187,7 +187,10 @@ class TelegramBot:
 
         async def _process() -> None:
             router = self._get_router(chat_id)
-            response = await router.handle_message(text)
+            response = await router.handle_message(
+                text,
+                on_checkpoint=lambda: self._save_router(chat_id),
+            )
             if response:
                 on_reply(response)
             self._save_router(chat_id)

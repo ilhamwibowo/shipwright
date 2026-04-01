@@ -70,6 +70,9 @@ class Config:
     # Max revision rounds in delegation loop (default: 3)
     max_revision_rounds: int = 3
 
+    # Retry roadmap tasks this many extra times before pausing (default: 1)
+    max_roadmap_task_retries: int = 1
+
     # Context reset threshold — reset employee session after N turns (default: 30)
     context_reset_threshold: int = 30
 

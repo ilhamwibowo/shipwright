@@ -1,6 +1,7 @@
 """Tests for the roadmap system: parsing, execution loop, resume, progress tracking."""
 
 import asyncio
+import inspect
 import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -237,25 +238,39 @@ class TestRoadmapTask:
             index=1,
             description="Build API",
             status=RoadmapTaskStatus.DONE,
+            attempts=2,
             output_summary="Created endpoints",
             handoff_artifact="context data",
+            last_started_at=123.0,
+            last_updated_at=456.0,
         )
         d = task.to_dict()
         assert d["index"] == 1
         assert d["description"] == "Build API"
         assert d["status"] == "done"
+        assert d["attempts"] == 2
+        assert d["last_started_at"] == 123.0
+        assert d["last_updated_at"] == 456.0
 
     def test_from_dict(self):
         d = {
             "index": 2,
             "description": "Write tests",
             "status": "failed",
+            "attempts": 2,
             "output_summary": "Error occurred",
             "handoff_artifact": "",
+            "last_error": "boom",
+            "last_started_at": 100.0,
+            "last_updated_at": 101.0,
         }
         task = RoadmapTask.from_dict(d)
         assert task.index == 2
         assert task.status == RoadmapTaskStatus.FAILED
+        assert task.attempts == 2
+        assert task.last_error == "boom"
+        assert task.last_started_at == 100.0
+        assert task.last_updated_at == 101.0
 
     def test_truncation(self):
         task = RoadmapTask(
@@ -263,10 +278,12 @@ class TestRoadmapTask:
             description="Test",
             output_summary="x" * 5000,
             handoff_artifact="y" * 5000,
+            last_error="z" * 1000,
         )
         d = task.to_dict()
         assert len(d["output_summary"]) == 2000
         assert len(d["handoff_artifact"]) == 3000
+        assert len(d["last_error"]) == 500
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +321,96 @@ class TestCompanyRoadmap:
 
         restored = Company.from_dict(data, config)
         assert restored.active_roadmap is None
+
+    def test_roadmap_persists_task_autonomy_metadata(self, config: Config):
+        company = Company(config=config)
+        company.active_roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(
+                    index=1,
+                    description="Task A",
+                    status=RoadmapTaskStatus.DONE,
+                    attempts=1,
+                    output_summary="Done",
+                    handoff_artifact="artifact",
+                    last_started_at=10.0,
+                    last_updated_at=11.0,
+                ),
+                RoadmapTask(
+                    index=2,
+                    description="Task B",
+                    status=RoadmapTaskStatus.FAILED,
+                    attempts=2,
+                    output_summary="Error: boom",
+                    last_error="boom",
+                    last_started_at=12.0,
+                    last_updated_at=13.0,
+                ),
+            ],
+            original_request="Big project",
+            approved=True,
+        )
+
+        restored = Company.from_dict(company.to_dict(), config)
+
+        assert restored.active_roadmap is not None
+        assert restored.active_roadmap.tasks[0].attempts == 1
+        assert restored.active_roadmap.tasks[1].attempts == 2
+        assert restored.active_roadmap.tasks[1].last_error == "boom"
+        assert restored.active_roadmap.tasks[1].last_started_at == 12.0
+        assert restored.active_roadmap.tasks[1].last_updated_at == 13.0
+
+    def test_roadmap_task_metadata_survives_company_round_trip(self, config: Config):
+        from shipwright.company.employee import RoadmapState
+
+        company = Company(config=config)
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(
+                    index=1,
+                    description="Bootstrap the project",
+                    status=RoadmapTaskStatus.DONE,
+                    output_summary="Created the initial scaffolding",
+                    handoff_artifact="artifact-1",
+                ),
+                RoadmapTask(
+                    index=2,
+                    description="Wire the control plane",
+                    status=RoadmapTaskStatus.RUNNING,
+                    output_summary="Checkpointing progress",
+                    handoff_artifact="artifact-2",
+                ),
+                RoadmapTask(
+                    index=3,
+                    description="Harden recovery",
+                    status=RoadmapTaskStatus.FAILED,
+                    output_summary="Transient failure captured",
+                    handoff_artifact="artifact-3",
+                ),
+            ],
+            original_request="Run autonomously for hours",
+            approved=True,
+            paused=True,
+            state=RoadmapState.PAUSED,
+        )
+        company.active_roadmap = roadmap
+
+        restored = Company.from_dict(company.to_dict(), config)
+
+        assert restored.active_roadmap is not None
+        assert restored.active_roadmap.original_request == "Run autonomously for hours"
+        assert restored.active_roadmap.approved is True
+        assert restored.active_roadmap.paused is True
+        assert restored.active_roadmap.state == RoadmapState.PAUSED
+        assert restored.active_roadmap.tasks[0].status == RoadmapTaskStatus.DONE
+        assert restored.active_roadmap.tasks[0].output_summary == "Created the initial scaffolding"
+        assert restored.active_roadmap.tasks[0].handoff_artifact == "artifact-1"
+        assert restored.active_roadmap.tasks[1].status == RoadmapTaskStatus.RUNNING
+        assert restored.active_roadmap.tasks[1].output_summary == "Checkpointing progress"
+        assert restored.active_roadmap.tasks[1].handoff_artifact == "artifact-2"
+        assert restored.active_roadmap.tasks[2].status == RoadmapTaskStatus.FAILED
+        assert restored.active_roadmap.tasks[2].output_summary == "Transient failure captured"
+        assert restored.active_roadmap.tasks[2].handoff_artifact == "artifact-3"
 
 
 class TestCTOChatRoadmap:
@@ -443,6 +550,76 @@ class TestExecuteRoadmap:
         assert company.active_roadmap.paused is True
         assert company.active_roadmap.tasks[0].status == RoadmapTaskStatus.FAILED
         assert "failed" in result.lower()
+
+    @pytest.mark.asyncio
+    async def test_execute_retries_before_pausing(self, config: Config):
+        """Roadmap retries a failed task before pausing."""
+        from dataclasses import replace
+
+        retry_config = replace(config, max_roadmap_task_retries=1)
+        company = Company(config=retry_config)
+        cto = company.ensure_cto()
+
+        roadmap = Roadmap(
+            tasks=[RoadmapTask(index=1, description="Task one")],
+            original_request="Build it",
+            approved=True,
+        )
+        company.active_roadmap = roadmap
+
+        attempts = 0
+
+        async def flaky_run(**kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("temporary failure")
+            return MemberResult(output="Done after retry.", session_id="s", num_turns=1)
+
+        with patch.object(cto, "run", side_effect=flaky_run):
+            with patch.object(cto, "save_handoff_artifact", return_value=None):
+                result = await company.execute_roadmap()
+
+        assert attempts == 2
+        assert "complete" in result.lower()
+        assert company.active_roadmap is None
+
+    @pytest.mark.asyncio
+    async def test_execute_checkpoints_task_transitions(self, config: Config):
+        """Roadmap execution checkpoints running and completed state transitions."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        roadmap = Roadmap(
+            tasks=[RoadmapTask(index=1, description="Task one")],
+            original_request="Build it",
+            approved=True,
+        )
+        company.active_roadmap = roadmap
+
+        snapshots: list[dict] = []
+
+        with patch.object(
+            cto, "run", new_callable=AsyncMock,
+            return_value=MemberResult(output="Done.", session_id="s", num_turns=1),
+        ):
+            with patch.object(cto, "save_handoff_artifact", return_value=None):
+                await company.execute_roadmap(
+                    on_checkpoint=lambda: snapshots.append(company.to_dict()),
+                )
+
+        assert len(snapshots) >= 3
+        assert any(
+            snap.get("active_roadmap", {}).get("tasks", [{}])[0].get("status") == "running"
+            for snap in snapshots
+            if snap.get("active_roadmap")
+        )
+        assert any(
+            snap.get("active_roadmap", {}).get("tasks", [{}])[0].get("attempts") == 1
+            for snap in snapshots
+            if snap.get("active_roadmap")
+        )
+        assert snapshots[-1].get("active_roadmap") is None
 
     @pytest.mark.asyncio
     async def test_execute_budget_exceeded(self, config: Config):
@@ -604,6 +781,105 @@ class TestExecuteRoadmap:
 
         # Alex should have been hired
         assert "Alex" in company.employees
+
+    @pytest.mark.asyncio
+    async def test_execute_roadmap_retries_transient_failure_before_pausing(self, config: Config):
+        """A transient task failure should be retried before the roadmap pauses."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        roadmap = Roadmap(
+            tasks=[RoadmapTask(index=1, description="Task one")],
+            original_request="Build it",
+            approved=True,
+        )
+        company.active_roadmap = roadmap
+
+        calls = 0
+
+        async def mock_run(**kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("temporary outage")
+            return MemberResult(output="Recovered and completed.", session_id="s", num_turns=1)
+
+        with patch.object(cto, "run", side_effect=mock_run):
+            with patch.object(cto, "save_handoff_artifact", return_value=None):
+                result = await company.execute_roadmap()
+
+        assert calls == 2
+        assert "complete" in result.lower()
+        assert company.active_roadmap is None
+
+    def test_execute_roadmap_exposes_checkpoint_hook(self):
+        """Long-running roadmap execution should expose a checkpoint callback hook."""
+        params = inspect.signature(Company.execute_roadmap).parameters
+        assert "on_checkpoint" in params
+
+    @pytest.mark.asyncio
+    async def test_execute_roadmap_checkpoints_transitions(self, config: Config):
+        """Roadmap execution should checkpoint durable state transitions."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        roadmap = Roadmap(
+            tasks=[RoadmapTask(index=1, description="Task one")],
+            original_request="Build it",
+            approved=True,
+        )
+        company.active_roadmap = roadmap
+
+        checkpoints: list[dict] = []
+
+        with patch.object(
+            cto,
+            "run",
+            new_callable=AsyncMock,
+            return_value=MemberResult(output="Done.", session_id="s", num_turns=1),
+        ):
+            with patch.object(cto, "save_handoff_artifact", return_value=None):
+                result = await company.execute_roadmap(
+                    on_checkpoint=lambda: checkpoints.append(company.to_dict()),
+                )
+
+        assert "complete" in result.lower()
+        assert len(checkpoints) >= 4
+        assert checkpoints[0]["active_roadmap"]["state"] == "running"
+        assert checkpoints[1]["active_roadmap"]["tasks"][0]["status"] == "running"
+        assert checkpoints[2]["active_roadmap"]["tasks"][0]["status"] == "done"
+        assert checkpoints[-1].get("active_roadmap") is None
+
+    @pytest.mark.asyncio
+    async def test_execute_roadmap_persists_attempt_metadata_on_failure(self, config: Config):
+        """Attempt/error metadata should survive roadmap serialization after retries."""
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        roadmap = Roadmap(
+            tasks=[RoadmapTask(index=1, description="Task one")],
+            original_request="Build it",
+            approved=True,
+        )
+        company.active_roadmap = roadmap
+
+        async def mock_run(**kwargs):
+            raise RuntimeError("temporary outage")
+
+        with patch.object(cto, "run", side_effect=mock_run):
+            result = await company.execute_roadmap()
+
+        assert "after 2 attempts" in result.lower()
+        assert "temporary outage" in result.lower()
+        task = company.active_roadmap.tasks[0]
+        restored = Roadmap.from_dict(company.active_roadmap.to_dict())
+
+        assert task.attempts == 2
+        assert task.last_error == "temporary outage"
+        assert task.last_started_at is not None
+        assert task.last_updated_at is not None
+        assert restored.tasks[0].attempts == 2
+        assert restored.tasks[0].last_error == "temporary outage"
 
 
 # ---------------------------------------------------------------------------
