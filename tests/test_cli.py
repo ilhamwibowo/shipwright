@@ -138,7 +138,7 @@ class TestCLIOutput:
         captured = capsys.readouterr()
         assert "Architect" in captured.out
         assert "Explore the codebase" in captured.out
-        assert YELLOW in captured.out
+        assert DIM in captured.out
 
     def test_on_delegation_end_success(self, capsys):
         ui = CLIOutput()
@@ -147,6 +147,7 @@ class TestCLIOutput:
         assert "Architect" in captured.out
         assert "12.3s" in captured.out
         assert GREEN in captured.out
+        assert DIM in captured.out
 
     def test_on_delegation_end_error(self, capsys):
         ui = CLIOutput()
@@ -175,8 +176,8 @@ class TestCLIOutputEventFeed:
         ui.on_delegation_start("architect", "Explore codebase", 1, 5)
         assert ui._event_count == 1
         captured = capsys.readouterr()
-        # Should have the event feed pipe separator
-        assert "\u2502" in captured.out
+        # Event feed uses dim indented text
+        assert DIM in captured.out
 
     def test_delegation_end_increments_events(self, capsys):
         ui = CLIOutput()

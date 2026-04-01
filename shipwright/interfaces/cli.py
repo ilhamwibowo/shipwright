@@ -131,7 +131,7 @@ def _term_width() -> int:
 # Status strip — compact one-line company state above the prompt
 # ---------------------------------------------------------------------------
 def _render_status_strip(router: Router) -> str:
-    """Render a compact status strip showing company state at a glance."""
+    """Render a compact, dim status strip above the prompt."""
     company = router.company
     if not company:
         return ""
@@ -141,9 +141,9 @@ def _render_status_strip(router: Router) -> str:
     # CTO status
     cto = company.get_cto()
     if cto:
-        parts.append(f"{BOLD}{BR_CYAN}CTO{RESET} {GREEN}{ICON_DOT}{RESET}")
+        parts.append("CTO")
     else:
-        parts.append(f"{DIM}CTO offline{RESET}")
+        parts.append("CTO offline")
 
     # Employee count (excluding CTO)
     n_emp = len([e for e in company.employees.values() if e.role != "cto"])
@@ -151,7 +151,7 @@ def _render_status_strip(router: Router) -> str:
         working = [e for e in company.employees.values()
                    if e.status == EmployeeStatus.WORKING and e.role != "cto"]
         if working:
-            parts.append(f"{YELLOW}{len(working)}{RESET}/{n_emp} working")
+            parts.append(f"{len(working)}/{n_emp} working")
         else:
             parts.append(f"{n_emp} idle")
 
@@ -159,23 +159,23 @@ def _render_status_strip(router: Router) -> str:
     rm = company.active_roadmap
     if rm:
         if rm.state == RoadmapState.RUNNING:
-            parts.append(f"roadmap {BR_CYAN}{rm.done_count}/{rm.total_count}{RESET}")
+            parts.append(f"roadmap {rm.done_count}/{rm.total_count}")
         elif rm.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
             label = "paused" if rm.state == RoadmapState.PAUSED else "interrupted"
-            parts.append(f"roadmap {YELLOW}{rm.done_count}/{rm.total_count} {label}{RESET}")
+            parts.append(f"roadmap {rm.done_count}/{rm.total_count} {label}")
         elif rm.state == RoadmapState.STOPPED:
-            parts.append(f"roadmap {RED}stopped{RESET}")
+            parts.append("roadmap stopped")
 
     # Session tag
     session_name = getattr(router, "session_name", "default")
     if session_name != "default":
-        parts.append(f"{DIM}{session_name}{RESET}")
+        parts.append(session_name)
 
     if not parts:
         return ""
 
-    sep = f" {DIM}\u2502{RESET} "
-    return f"  {DIM}\u2500{RESET} {sep.join(parts)} {DIM}\u2500{RESET}"
+    sep = f" {ICON_DOT} "
+    return f"  {DIM}{sep.join(parts)}{RESET}"
 
 
 # Commands recognised by the REPL (for tab completion)
@@ -309,25 +309,21 @@ class CLIOutput:
     def on_delegation_start(
         self, member_name: str, task: str, round_num: int, max_rounds: int
     ) -> None:
-        """Called when an employee starts working — compact event line."""
+        """Called when an employee starts working — quiet event line."""
         if self.spinner.active:
             self.spinner.stop()
         sys.stdout.write(RESET)
         self._event_separator()
 
-        role_id = self._get_role_for_name(member_name)
-        color = role_color(role_id)
         display_name = member_name.replace("_", " ").title()
         short_task = task.split("\n")[0][:55]
 
         round_tag = ""
         if round_num > 1:
-            round_tag = f" {DIM}r{round_num}{RESET}"
+            round_tag = f" r{round_num}"
 
         sys.stdout.write(
-            f"\n  {DIM}\u2502{RESET} {YELLOW}{ICON_DELEGATE}{RESET} "
-            f"{color}{display_name}{RESET}"
-            f" {DIM}{ICON_ARROW} {short_task}{RESET}{round_tag}\n"
+            f"\n    {DIM}{display_name} {ICON_ARROW} {short_task}{round_tag}{RESET}\n"
         )
         sys.stdout.flush()
         self._event_count += 1
@@ -336,52 +332,32 @@ class CLIOutput:
     def on_delegation_end(
         self, member_name: str, duration_s: float, is_error: bool
     ) -> None:
-        """Called when an employee finishes — compact result with timing."""
+        """Called when an employee finishes — quiet result with timing."""
         if self.spinner.active:
             self.spinner.stop()
 
-        role_id = self._get_role_for_name(member_name)
-        color = role_color(role_id)
         display_name = member_name.replace("_", " ").title()
         time_str = _format_elapsed(duration_s)
 
         if is_error:
             sys.stdout.write(
-                f"  {DIM}\u2502{RESET} {RED}{ICON_FAIL}{RESET} "
-                f"{color}{display_name}{RESET} "
-                f"{RED}failed{RESET}  {DIM}{time_str}{RESET}\n"
+                f"    {DIM}{display_name}{RESET} {RED}failed{RESET}"
+                f" {DIM}{time_str}{RESET}\n"
             )
         else:
             sys.stdout.write(
-                f"  {DIM}\u2502{RESET} {GREEN}{ICON_DONE}{RESET} "
-                f"{color}{display_name}{RESET} "
-                f"{GREEN}done{RESET}  {DIM}{time_str}{RESET}\n"
+                f"    {DIM}{display_name} {GREEN}done{DIM}  {time_str}{RESET}\n"
             )
         sys.stdout.flush()
         self._event_count += 1
 
     def on_progress(self, message: str) -> None:
-        """Show a progress status line in the event feed."""
+        """Show a progress status line — quiet, secondary to conversation."""
         if self.spinner.active:
             self.spinner.stop()
         self._event_separator()
 
-        lower = message.lower()
-        if "reviewing" in lower or "review" in lower:
-            icon = f"{BR_BLUE}{ICON_REVIEW}{RESET}"
-        elif "revis" in lower:
-            icon = f"{YELLOW}{ICON_REVISE}{RESET}"
-        elif "roadmap task" in lower:
-            # Parse roadmap progress from message like "Roadmap task 2/5: ..."
-            icon = f"{BR_CYAN}{ICON_TASK}{RESET}"
-        elif "remaining" in lower:
-            icon = f"{DIM}{ICON_PENDING}{RESET}"
-        elif "hiring" in lower or "hired" in lower:
-            icon = f"{GREEN}{ICON_HIRE}{RESET}"
-        else:
-            icon = f"{DIM}{ICON_DOT}{RESET}"
-
-        sys.stdout.write(f"  {DIM}\u2502{RESET} {icon} {DIM}{message}{RESET}\n")
+        sys.stdout.write(f"    {DIM}{message}{RESET}\n")
         sys.stdout.flush()
         self._event_count += 1
         self.spinner.start(message)
@@ -572,53 +548,43 @@ def _setup_completer(router: Router) -> None:
 # Startup display
 # ---------------------------------------------------------------------------
 def _print_startup(router: Router, session_name: str) -> None:
-    """Print a clean, intentional startup screen."""
+    """Print a minimal, composed startup screen."""
     print()
     print(f"  {BOLD}{BR_CYAN}shipwright{RESET}")
-    print()
 
     company = router.company
     cto = company.get_cto() if company else None
     n_emp = len([e for e in company.employees.values() if e.role != "cto"]) if company else 0
 
     if cto or n_emp:
-        # Restored session — show compact state
+        # Restored session — one compact state line
         parts: list[str] = []
         if cto:
-            parts.append(f"{BOLD}{BR_CYAN}CTO{RESET} {GREEN}online{RESET}")
+            parts.append("CTO")
         if n_emp:
             working = [e for e in company.employees.values()
                        if e.status == EmployeeStatus.WORKING and e.role != "cto"]
             if working:
-                names = ", ".join(e.name for e in working[:3])
-                parts.append(f"{YELLOW}{len(working)}{RESET} working ({names})")
+                parts.append(f"{len(working)} working")
             else:
-                parts.append(f"{n_emp} employee{'s' if n_emp != 1 else ''}")
+                parts.append(f"{n_emp} idle")
 
-        sep = f" {DIM}{ICON_DOT}{RESET} "
-        print(f"  {sep.join(parts)}")
+        sep = f" {ICON_DOT} "
+        print(f"  {DIM}{sep.join(parts)}{RESET}")
 
-        # Show roadmap state if active
+        # Roadmap state (if noteworthy)
         rm = company.active_roadmap
-        if rm:
-            if rm.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
-                label = "paused" if rm.state == RoadmapState.PAUSED else "interrupted"
-                desc = rm.paused_task_description or ""
-                short = f": {desc[:45]}" if desc else ""
-                print(f"  {YELLOW}{ICON_WARN}{RESET} Roadmap {rm.done_count}/{rm.total_count} {YELLOW}{label}{RESET}{short}")
-                print(f"  Type {BOLD}continue{RESET} to resume or {BOLD}roadmap{RESET} for details.")
-            elif rm.state == RoadmapState.RUNNING:
-                print(f"  {BR_CYAN}{ICON_TASK}{RESET} Roadmap {rm.done_count}/{rm.total_count} in progress")
+        if rm and rm.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
+            label = "paused" if rm.state == RoadmapState.PAUSED else "interrupted"
+            print(f"  {DIM}Roadmap {rm.done_count}/{rm.total_count} {label}{RESET}")
+        elif rm and rm.state == RoadmapState.RUNNING:
+            print(f"  {DIM}Roadmap {rm.done_count}/{rm.total_count} running{RESET}")
 
         if company.is_stale:
-            print(f"  {YELLOW}{ICON_WARN} Worktree no longer exists (stale){RESET}")
+            print(f"  {DIM}{ICON_WARN} Stale worktree{RESET}")
 
         if session_name != "default":
-            print(f"  {DIM}session: {session_name}{RESET}")
-    else:
-        # Fresh session
-        print(f"  {DIM}Describe what you need. The CTO handles the rest.{RESET}")
-        print(f"  {DIM}Type {RESET}{BOLD}help{RESET}{DIM} for commands.{RESET}")
+            print(f"  {DIM}{session_name}{RESET}")
 
     print()
 
@@ -712,7 +678,7 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
                 elapsed = ui.elapsed
                 if elapsed >= 2.0:
                     time_str = _format_elapsed(elapsed)
-                    print(f"  {DIM}{ICON_DONE} {time_str}{RESET}")
+                    print(f"  {DIM}{time_str}{RESET}")
                 print()
 
             except KeyboardInterrupt:
@@ -808,7 +774,7 @@ async def run_oneshot(
     elapsed = ui.elapsed
     if elapsed >= 1.0:
         time_str = _format_elapsed(elapsed)
-        print(f"  {DIM}{ICON_DONE} {time_str}{RESET}")
+        print(f"  {DIM}{time_str}{RESET}")
     print()
 
     save_state(router.to_dict(), config, session_id=router.session_name)

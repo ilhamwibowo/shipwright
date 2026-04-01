@@ -10,6 +10,8 @@ from shipwright.workspace.git import (
     cleanup_worktree,
     commit,
     create_worktree,
+    get_ahead_behind,
+    get_branch_context,
     get_current_branch,
     get_default_branch,
     get_log,
@@ -62,6 +64,24 @@ class TestGitHelpers:
         commit(sample_repo, "add new file")
         log = get_log(sample_repo)
         assert "add new file" in log
+
+    def test_get_ahead_behind_no_remote(self, sample_repo: Path):
+        ahead, behind = get_ahead_behind(sample_repo)
+        # No remote configured → both zero
+        assert ahead == 0
+        assert behind == 0
+
+    def test_get_branch_context(self, sample_repo: Path):
+        ctx = get_branch_context(sample_repo)
+        assert "Branch:" in ctx
+        assert "Working tree: clean" in ctx
+        assert "Recent commits:" in ctx
+        assert "init" in ctx
+
+    def test_get_branch_context_with_changes(self, sample_repo: Path):
+        (sample_repo / "dirty.txt").write_text("uncommitted")
+        ctx = get_branch_context(sample_repo)
+        assert "1 changed file" in ctx
 
     def test_worktree_lifecycle(self, sample_repo: Path):
         branch = "shipwright/test-branch"

@@ -458,6 +458,19 @@ class Company:
                     f"({rm.done_count}/{rm.total_count} done). This is just context."
                 )
 
+        # Git context — refreshed on each prompt build so the CTO sees
+        # the latest branch/diff/commit state.
+        from shipwright.workspace.git import get_branch_context
+
+        try:
+            git_context = get_branch_context(self.config.repo_root)
+        except Exception:
+            git_context = ""
+
+        repo_section = ""
+        if git_context:
+            repo_section = f"\n### Repository State\n{git_context}"
+
         return f"""{base_prompt}
 
 ## Current Company State
@@ -471,6 +484,7 @@ class Company:
 
 ### Project
 {self.project_context or "No project context loaded yet."}
+{repo_section}
 """
 
     async def cto_chat(

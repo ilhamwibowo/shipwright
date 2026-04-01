@@ -141,3 +141,100 @@ def get_current_branch(repo: str | Path) -> str:
 def get_log(repo: str | Path, n: int = 10) -> str:
     """Get recent git log."""
     return _git(["log", "--oneline", f"-{n}"], repo)
+
+
+def get_diff_stat(repo: str | Path) -> str:
+    """Get compact diff stat showing changed files."""
+    return _git(["diff", "--stat", "--stat-width=60"], repo)
+
+
+def get_ahead_behind(repo: str | Path) -> tuple[int, int]:
+    """Get commits ahead/behind tracking branch. Returns (ahead, behind)."""
+    try:
+        result = _git(
+            ["rev-list", "--left-right", "--count", "@{upstream}...HEAD"], repo,
+        )
+        parts = result.split()
+        if len(parts) == 2:
+            return int(parts[1]), int(parts[0])  # ahead, behind
+    except GitError:
+        pass
+    return 0, 0
+
+
+def get_branch_context(repo: str | Path) -> str:
+    """Build a comprehensive git context string for CTO prompts.
+
+    Includes branch name, ahead/behind, working tree status, and recent
+    commits.  Designed to be injected into the CTO's system prompt so it
+    can answer repo-state questions without running git commands itself.
+    """
+    lines: list[str] = []
+
+    try:
+        branch = get_current_branch(repo)
+        lines.append(f"Branch: {branch}")
+    except GitError:
+        lines.append("Branch: (unknown — detached HEAD or not a git repo)")
+        return "\n".join(lines)
+
+    # Ahead/behind remote
+    ahead, behind = get_ahead_behind(repo)
+    if ahead or behind:
+        parts = []
+        if ahead:
+            parts.append(f"{ahead} ahead")
+        if behind:
+            parts.append(f"{behind} behind")
+        lines.append(f"Remote: {', '.join(parts)}")
+
+    # Working tree status
+    try:
+        status_output = get_status(repo)
+        if status_output:
+            file_lines = [l for l in status_output.strip().split("\n") if l.strip()]
+            n = len(file_lines)
+            lines.append(f"Working tree: {n} changed file{'s' if n != 1 else ''}")
+            for fl in file_lines[:15]:
+                lines.append(f"  {fl}")
+            if n > 15:
+                lines.append(f"  ... and {n - 15} more")
+        else:
+            lines.append("Working tree: clean")
+    except GitError:
+        pass
+
+    # Branch-specific commits (vs default branch)
+    try:
+        default = get_default_branch(repo)
+        if branch != default:
+            try:
+                branch_log = _git(
+                    ["log", "--oneline", f"{default}..HEAD", "-10"], repo,
+                )
+                if branch_log:
+                    commit_lines = branch_log.strip().split("\n")
+                    count = len(commit_lines)
+                    lines.append(
+                        f"Branch commits ({count} since {default}):"
+                    )
+                    for cl in commit_lines[:8]:
+                        lines.append(f"  {cl}")
+                    if count > 8:
+                        lines.append(f"  ... and {count - 8} more")
+            except GitError:
+                pass
+    except GitError:
+        pass
+
+    # Recent commits (always)
+    try:
+        log = get_log(repo, 5)
+        if log:
+            lines.append("Recent commits:")
+            for cl in log.strip().split("\n"):
+                lines.append(f"  {cl}")
+    except GitError:
+        pass
+
+    return "\n".join(lines)
