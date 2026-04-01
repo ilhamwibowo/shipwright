@@ -83,6 +83,21 @@ class TestRenderMarkdown:
     def test_empty_string(self):
         assert render_markdown("") == ""
 
+    def test_blockquote(self):
+        result = render_markdown("> keep going")
+        assert "keep going" in result
+        assert "▌" in result
+
+    def test_bullet_list(self):
+        result = render_markdown("- first item")
+        assert "first item" in result
+        assert "•" in result
+
+    def test_ordered_list(self):
+        result = render_markdown("1. first item")
+        assert "first item" in result
+        assert "1." in result
+
 
 # ---------------------------------------------------------------------------
 # CLIOutput
@@ -104,6 +119,13 @@ class TestCLIOutput:
         captured = capsys.readouterr()
         assert CYAN in captured.out
         assert "hello" in captured.out
+
+    def test_on_text_prints_speaker_label(self, capsys):
+        ui = CLIOutput()
+        ui.start_thinking("CTO", "cto")
+        ui.on_text("hello")
+        captured = capsys.readouterr()
+        assert "[CTO]" in captured.out
 
     def test_finish_response_resets(self, capsys):
         ui = CLIOutput()
@@ -229,6 +251,200 @@ class TestStatusStrip:
             router.company.ensure_cto()
             strip = _render_status_strip(router)
             assert "CTO" in strip
+
+    def test_status_strip_mentions_events(self):
+        from shipwright.interfaces.cli import _render_status_strip
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            router = Router(config=config, session=Session(id="test"))
+            router.company.ensure_cto()
+            router._log_event("hire", "Alex", "Backend Developer")
+            strip = _render_status_strip(router)
+            assert "events 1" in strip
+
+
+class TestControlRoomPanels:
+    def test_render_control_header_contains_bridge_metadata(self):
+        from shipwright.interfaces.cli import _render_control_header
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            router = Router(config=config, session=Session(id="test"), session_name="bridge")
+            header = _render_control_header(router, "bridge")
+            assert "COMMAND BRIDGE" in header
+            assert "session" in header
+
+    def test_render_operator_hints_empty_company(self):
+        from shipwright.interfaces.cli import _render_operator_hints
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            router = Router(config=config, session=Session(id="test"))
+            hints = _render_operator_hints(router)
+            assert "Tell the CTO what to build" in hints
+
+    def test_render_cycle_footer_includes_ops_and_roadmap(self):
+        from shipwright.interfaces.cli import _render_cycle_footer
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from shipwright.company.employee import Roadmap, RoadmapState, RoadmapTask
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            router = Router(config=config, session=Session(id="test"))
+            router.company.active_roadmap = Roadmap(
+                tasks=[RoadmapTask(index=1, description="Build API")],
+                original_request="Build API",
+                approved=True,
+                state=RoadmapState.RUNNING,
+            )
+
+            ui = CLIOutput()
+            ui._event_count = 2
+            ui._start_time = time.time() - 1.2
+
+            footer = _render_cycle_footer(ui, router)
+            assert "2 ops" in footer
+            assert "0/1 running" in footer
+
+
+class TestPromptRendering:
+    def test_build_prompt_uses_cto_brackets(self):
+        from shipwright.interfaces.cli import _build_prompt
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            router = Router(config=config, session=Session(id="test"))
+            router.company.ensure_cto()
+            prompt = _build_prompt(router)
+            assert "[CTO]" in prompt
+
+    def test_build_prompt_uses_named_employee_brackets(self):
+        from shipwright.interfaces.cli import _build_prompt
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from shipwright.company.roles import get_role_def
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            router = Router(config=config, session=Session(id="test"))
+            router.company.hire("backend-dev", get_role_def("backend-dev"), name="GeminiDev")
+            prompt = _build_prompt(router)
+            assert "[GeminiDev]" in prompt
+            assert "Backend Developer" in prompt
+
+
+class TestControlPanels:
+    def test_render_session_panel(self):
+        from shipwright.interfaces.cli import _render_session_panel
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            router = Router(config=config, session=Session(id="session-a"), session_name="session-a")
+            router.company.ensure_cto()
+            panel = _render_session_panel(router)
+            assert "SESSION" in panel
+            assert "session-a" in panel
+            assert "messages" in panel.lower()
+
+    def test_render_roadmap_panel_empty(self):
+        from shipwright.interfaces.cli import _render_roadmap_panel
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            router = Router(config=config, session=Session(id="session-a"))
+            panel = _render_roadmap_panel(router)
+            assert "ROADMAP" in panel
+            assert "No active roadmap" in panel
+
+    def test_render_roadmap_panel_with_tasks(self):
+        from shipwright.interfaces.cli import _render_roadmap_panel
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from shipwright.company.employee import Roadmap, RoadmapTask, RoadmapState, RoadmapTaskStatus
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            router = Router(config=config, session=Session(id="session-a"))
+            router.company.ensure_cto()
+            router.company.active_roadmap = Roadmap(
+                tasks=[
+                    RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.DONE),
+                    RoadmapTask(index=2, description="Write tests", status=RoadmapTaskStatus.RUNNING),
+                    RoadmapTask(index=3, description="Ship it"),
+                ],
+                original_request="Build an API",
+                approved=True,
+                state=RoadmapState.RUNNING,
+            )
+            panel = _render_roadmap_panel(router)
+            assert "ROADMAP" in panel
+            assert "Build an API" in panel
+            assert "Build API" in panel
+            assert "Write tests" in panel
+
+    def test_print_startup_renders_dashboard(self, capsys):
+        from shipwright.interfaces.cli import _print_startup
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from shipwright.company.roles import get_role_def
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            router = Router(config=config, session=Session(id="session-a"), session_name="session-a")
+            router.company.ensure_cto()
+            router.company.hire("backend-dev", get_role_def("backend-dev"), name="GeminiDev")
+            router._log_event("hire", "GeminiDev", "Backend Developer")
+            _print_startup(router, "session-a")
+            captured = capsys.readouterr()
+            assert "COMMAND BRIDGE" in captured.out
+            assert "OPS" in captured.out
+            assert "SESSION" in captured.out
+            assert "ROADMAP" in captured.out
+            assert "CREW" in captured.out
 
 
 class TestSpinner:

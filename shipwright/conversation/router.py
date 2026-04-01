@@ -6,6 +6,7 @@ Routes commands and conversational messages through the Company.
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -30,9 +31,25 @@ from shipwright.persistence.store import (
     save_state,
 )
 from shipwright.utils.logging import get_logger
+from shipwright.workspace.git import (
+    GitError,
+    get_ahead_behind,
+    get_current_branch,
+    get_diff_stat,
+    get_log,
+    get_status,
+)
 from shipwright.workspace.project import ProjectInfo, discover_project
 
 logger = get_logger("conversation.router")
+
+
+def _fmt_elapsed(secs: float) -> str:
+    """Compact elapsed time for display."""
+    if secs < 60:
+        return f"{secs:.0f}s"
+    m, s = divmod(int(secs), 60)
+    return f"{m}m {s}s" if s else f"{m}m"
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +75,7 @@ _GREETING_PATTERNS: set[str] = {
     "afternoon", "good afternoon",
     "evening", "good evening",
     "howdy", "whats up", "what's up", "wassup", "wazzup",
+    "wasup", "wassap", "wasap", "whaddup", "waddup",
     "hiya", "heya", "heyy", "heyyy",
     "greetings", "salutations",
     "hi there", "hello there", "hey there",
@@ -66,12 +84,20 @@ _GREETING_PATTERNS: set[str] = {
 
 # Small-talk patterns that are NOT work requests
 _SMALLTALK_PATTERNS: set[str] = {
-    "how are you", "how's it going", "how are things",
-    "what's good", "how do you do",
+    "how are you", "how are things", "what's good", "how do you do",
     "long time no see", "nice to see you",
     "thanks", "thank you", "ty", "thx",
     "cool", "nice", "great", "awesome", "ok", "okay", "k",
     "got it", "understood", "noted",
+}
+
+_STATUS_QUERY_PATTERNS: set[str] = {
+    "how's it going", "hows it going", "what's the status", "whats the status",
+    "status update", "what's going on", "whats going on", "where are we at",
+    "where are we", "how's the team", "hows the team", "how's the repo",
+    "hows the repo", "what changed", "what's changed", "whats changed",
+    "what branch are we on", "what branch am i on", "repo status",
+    "branch status", "what's the repo state", "whats the repo state",
 }
 
 _RESUME_PATTERNS: set[str] = {
@@ -97,6 +123,20 @@ _STOP_PATTERNS: set[str] = {
     "scrap it", "kill it", "scratch that",
 }
 
+_GREETING_SLANG_RE = re.compile(
+    r"^(?:w+a+s+(?:a|u)?p+|w+a+z+u+p+|w+h?a+d+d*u+p+)$"
+)
+_STATUS_QUERY_RE = re.compile(
+    r"\b(status|changed|branch|repo)\b|what are people working on|who(?:'s|s)? working|how's the team|hows the team"
+)
+
+
+def _normalize_intent_text(text: str) -> str:
+    """Normalize casual user input for intent classification."""
+    lower = text.lower().strip()
+    lower = re.sub(r"[!?.,:;]+$", "", lower)
+    return re.sub(r"\s+", " ", lower)
+
 
 def classify_intent(text: str) -> str:
     """Classify user intent from message text.
@@ -104,7 +144,8 @@ def classify_intent(text: str) -> str:
     Returns one of the Intent constants. This runs BEFORE any command parsing
     or CTO routing, so it catches greetings and execution controls early.
     """
-    lower = text.lower().strip().rstrip("!?.,:;")
+    lower = _normalize_intent_text(text)
+    squashed = re.sub(r"[^a-z]", "", lower)
 
     # Exact match first (highest confidence)
     if lower in _PAUSE_NOW_PATTERNS:
@@ -117,8 +158,12 @@ def classify_intent(text: str) -> str:
         return Intent.RESUME
     if lower in _GREETING_PATTERNS:
         return Intent.GREETING
+    if lower in _STATUS_QUERY_PATTERNS:
+        return Intent.STATUS_QUERY
     if lower in _SMALLTALK_PATTERNS:
         return Intent.GREETING  # treat small talk same as greeting
+    if _GREETING_SLANG_RE.fullmatch(squashed):
+        return Intent.GREETING
 
     # Fuzzy greeting detection: short messages that look casual
     # Only 1-2 words where the first word is a greeting — "hi team", "hey cto"
@@ -129,6 +174,12 @@ def classify_intent(text: str) -> str:
                          "afternoon", "evening", "howdy", "hiya", "heya",
                          "greetings", "hola", "gm"}:
             return Intent.GREETING
+        first_word = re.sub(r"[^a-z]", "", words[0])
+        if _GREETING_SLANG_RE.fullmatch(first_word):
+            return Intent.GREETING
+
+    if _STATUS_QUERY_RE.search(lower):
+        return Intent.STATUS_QUERY
 
     return Intent.TASK
 
@@ -146,6 +197,7 @@ class Router:
     company: Company = field(init=False)
     session_name: str = "default"
     _project_info: ProjectInfo | None = field(default=None, repr=False)
+    _events: list = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         self.company = Company(config=self.config)
@@ -155,6 +207,32 @@ class Router:
         if self._project_info is None:
             self._project_info = discover_project(self.config.repo_root)
         return self._project_info
+
+    def _log_event(self, kind: str, name: str = "", detail: str = "") -> None:
+        """Append an event to the control-room feed."""
+        self._events.append({
+            "ts": time.time(), "kind": kind, "name": name, "detail": detail,
+        })
+        if len(self._events) > 50:
+            self._events = self._events[-50:]
+
+    def _restore_events(self, events: list[dict] | None) -> None:
+        """Restore persisted events with basic validation and trimming."""
+        if not isinstance(events, list):
+            self._events = []
+            return
+
+        restored: list[dict] = []
+        for event in events[-50:]:
+            if not isinstance(event, dict):
+                continue
+            restored.append({
+                "ts": event.get("ts", time.time()),
+                "kind": str(event.get("kind", "")),
+                "name": str(event.get("name", "")),
+                "detail": str(event.get("detail", "")),
+            })
+        self._events = restored
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -252,6 +330,11 @@ class Router:
                 response = f"Error communicating with {resolved}: {e}"
                 self.session.add_system_message(response)
                 return response
+
+        if intent == Intent.STATUS_QUERY:
+            response = self._handle_status_query(text)
+            self.session.add_system_message(response)
+            return response
 
         # ---- 2. Async: assign work -----------------------------------------
         # "assign <target> to <team>" — team membership (sync, handled below)
@@ -409,7 +492,7 @@ class Router:
         """Try synchronous commands. Returns (is_command, response)."""
 
         # roadmap / board — show current roadmap status
-        if lower in ("roadmap", "roadmap status", "plan", "board"):
+        if lower in ("roadmap", "roadmap status", "plan", "board", "tasks"):
             return True, self._roadmap_status()
 
         # back — return to CTO
@@ -447,6 +530,10 @@ class Router:
         if lower in ("who", "who is working", "workers"):
             return True, self._who()
 
+        # events — recent activity feed
+        if lower in ("events", "event log", "activity", "log"):
+            return True, self._events_view()
+
         # team create <name>
         team_create_match = re.match(r'^team\s+create\s+(.+)$', lower)
         if team_create_match:
@@ -471,6 +558,9 @@ class Router:
         # status — company overview
         if lower in ("status", "overview"):
             return True, self._status()
+
+        if lower in ("repo", "repo status", "git", "branch"):
+            return True, self._repo_status_summary()
 
         # costs
         if lower in ("costs", "cost", "spending", "budget"):
@@ -592,6 +682,7 @@ class Router:
             return str(e)
 
         display = ROLE_DISPLAY_NAMES.get(role_id, role_def.role)
+        self._log_event("hire", employee.name, display)
         return f"Hired **{employee.name}** as {display} (idle)"
 
     def _fire(self, target: str, confirmed: bool = False) -> str:
@@ -621,12 +712,14 @@ class Router:
             try:
                 fired = self.company.fire_team(resolved)
                 names = ", ".join(e.name for e in fired)
+                self._log_event("fire", resolved, "team")
                 return f"Fired team **{resolved}** ({names})."
             except ValueError as e:
                 return str(e)
         else:
             try:
                 emp = self.company.fire(resolved)
+                self._log_event("fire", emp.name, emp.role_def.role)
                 return f"Fired **{emp.name}** ({emp.role_def.role})."
             except ValueError as e:
                 return str(e)
@@ -646,30 +739,51 @@ class Router:
         return "\n".join(lines)
 
     def _who(self) -> str:
-        """Quick view: who is doing what right now."""
+        """Crew roster \u2014 who is doing what right now."""
         employees = [
             e for e in self.company.employees.values() if e.role != "cto"
         ]
         if not employees:
-            return "No employees hired yet."
+            return "No employees hired yet. Tell the CTO what to build."
 
         lines: list[str] = []
         working = [e for e in employees if e.status == EmployeeStatus.WORKING]
         idle = [e for e in employees if e.status == EmployeeStatus.IDLE]
+        blocked = [e for e in employees if e.status == EmployeeStatus.BLOCKED]
 
         if working:
             lines.append("**Working**")
             for e in working:
-                task = e.current_task.description[:50] if e.current_task else "..."
-                lines.append(f"  {e.name} ({e.display_role}) \u2014 {task}")
+                task = (
+                    e.current_task.description.split("\n")[0][:40]
+                    if e.current_task else "..."
+                )
+                elapsed = ""
+                if e.current_task and e.current_task.created_at:
+                    secs = time.time() - e.current_task.created_at
+                    if secs >= 1:
+                        elapsed = f"  {_fmt_elapsed(secs)}"
+                lines.append(
+                    f"  \u25cf {e.name} ({e.display_role}) \u2014 {task}{elapsed}"
+                )
+
+        if blocked:
+            lines.append("**Blocked**")
+            for e in blocked:
+                lines.append(f"  \u25a0 {e.name} ({e.display_role})")
+
         if idle:
-            lines.append("**Idle**" if working else "**All idle**")
+            lines.append("**Idle**" if working or blocked else "**All idle**")
             for e in idle:
+                n_tasks = len(e.task_history)
                 last = ""
                 if e.task_history:
                     lt = e.task_history[-1]
                     last = f" \u2014 last: {lt.description[:35]}"
-                lines.append(f"  {e.name} ({e.display_role}){last}")
+                task_tag = f"  [{n_tasks}t]" if n_tasks else ""
+                lines.append(
+                    f"  \u25cb {e.name} ({e.display_role}){task_tag}{last}"
+                )
 
         return "\n".join(lines)
 
@@ -741,10 +855,14 @@ class Router:
         """Show concise company status."""
         n = len(self.company.employees)
         if n == 0:
-            return (
+            response = (
                 "No employees yet.\n"
                 "Tell the CTO what to build, or type `hire <role>` directly."
             )
+            repo = self._repo_status_summary()
+            if repo != "Repo state unavailable.":
+                response += f"\n\n{repo}"
+            return response
 
         working = [e for e in self.company.employees.values()
                    if e.status == EmployeeStatus.WORKING and e.role != "cto"]
@@ -773,6 +891,11 @@ class Router:
         # Cost
         if self.company.total_cost > 0:
             parts.append(f"  Cost: ${self.company.total_cost:.4f}")
+
+        repo = self._repo_status_summary()
+        if repo != "Repo state unavailable.":
+            parts.append("")
+            parts.append(repo)
 
         return "\n".join(parts)
 
@@ -843,6 +966,7 @@ class Router:
             "  `back` \u2014 Return to CTO\n\n"
             "  **Visibility**\n"
             "  `status` \u2014 Quick company overview\n"
+            "  `repo` \u2014 Branch and working tree summary\n"
             "  `org` \u2014 Org chart with teams\n"
             "  `who` \u2014 Who is doing what right now\n"
             "  `roadmap` \u2014 Current roadmap progress\n"
@@ -902,46 +1026,221 @@ class Router:
     def _inspect(self, name: str) -> str:
         return inspect_role(name, self.config)
 
+    def _events_view(self) -> str:
+        """Show the recent event log."""
+        if not self._events:
+            return "No events yet. Activity will appear here as work happens."
+
+        from datetime import datetime
+
+        lines = ["**Events**\n"]
+        _ICONS = {
+            "hire": "+", "fire": "\u2212", "delegate": "\u25b6",
+            "done": "\u2713", "fail": "\u2717", "pause": "\u2016",
+            "resume": "\u25b6", "stop": "\u25a0",
+        }
+
+        for ev in self._events[-20:]:
+            ts = datetime.fromtimestamp(ev["ts"]).strftime("%H:%M")
+            icon = _ICONS.get(ev["kind"], "\u00b7")
+            name = ev.get("name", "")
+            detail = ev.get("detail", "")
+
+            if ev["kind"] == "hire":
+                text = f"Hired {name} as {detail}"
+            elif ev["kind"] == "fire":
+                text = f"Dismissed {name}"
+            elif ev["kind"] == "delegate":
+                text = f"{name} \u2192 {detail}"
+            elif ev["kind"] == "done":
+                text = f"{name} done  {detail}"
+            elif ev["kind"] == "fail":
+                text = f"{name} failed  {detail}"
+            elif ev["kind"] == "pause":
+                text = "Roadmap paused"
+            elif ev["kind"] == "resume":
+                text = "Roadmap resumed"
+            elif ev["kind"] == "stop":
+                text = "Roadmap stopped"
+            else:
+                text = f"{name} {detail}".strip()
+
+            lines.append(f"  {ts}  {icon} {text}")
+
+        return "\n".join(lines)
+
+    def _repo_status_summary(self) -> str:
+        """Synthesize a concise repository state summary."""
+        try:
+            branch = get_current_branch(self.config.repo_root)
+        except GitError:
+            return "Repo: state unavailable."
+
+        parts = [f"branch **{branch}**"]
+
+        try:
+            ahead, behind = get_ahead_behind(self.config.repo_root)
+            remote_bits: list[str] = []
+            if ahead:
+                remote_bits.append(f"{ahead} ahead")
+            if behind:
+                remote_bits.append(f"{behind} behind")
+            if remote_bits:
+                parts.append(", ".join(remote_bits))
+        except GitError:
+            pass
+
+        try:
+            status_lines = [line for line in get_status(self.config.repo_root).splitlines() if line.strip()]
+        except GitError:
+            status_lines = []
+
+        if not status_lines:
+            parts.append("working tree clean")
+            summary = "Repo: " + " · ".join(parts) + "."
+            try:
+                recent = get_log(self.config.repo_root, 3)
+            except GitError:
+                recent = ""
+            if recent:
+                summary += "\nRecent commits:\n" + "\n".join(
+                    f"  {line}" for line in recent.splitlines()
+                )
+            return summary
+
+        parts.append(f"{len(status_lines)} changed file(s)")
+        summary = "Repo: " + " · ".join(parts) + "."
+        summary += "\nChanged files:\n" + "\n".join(
+            f"  {line}" for line in status_lines[:8]
+        )
+        if len(status_lines) > 8:
+            summary += f"\n  ... and {len(status_lines) - 8} more"
+
+        try:
+            diff_stat = get_diff_stat(self.config.repo_root)
+        except GitError:
+            diff_stat = ""
+
+        if not diff_stat:
+            return summary
+
+        first_lines = diff_stat.splitlines()[:3]
+        return summary + "\nDiff stat:\n" + "\n".join(f"  {line}" for line in first_lines)
+
+    def _handle_status_query(self, text: str) -> str:
+        """Answer project/team/repo status questions directly from current state."""
+        lower = _normalize_intent_text(text)
+        wants_repo = any(token in lower for token in (
+            "repo", "branch", "changed", "commit", "diff", "git",
+        ))
+
+        company = self.company
+        employees = [e for e in company.employees.values() if e.role != "cto"]
+        working = [e for e in employees if e.status == EmployeeStatus.WORKING]
+        idle = [e for e in employees if e.status == EmployeeStatus.IDLE]
+        blocked = [e for e in employees if e.status == EmployeeStatus.BLOCKED]
+
+        lines: list[str] = []
+
+        if wants_repo:
+            lines.append(self._repo_status_summary())
+            if working or idle or blocked or company.active_roadmap:
+                lines.append("")
+                if working:
+                    names = ", ".join(e.name for e in working[:3])
+                    lines.append(
+                        f"Crew: {names}"
+                        f"{' are' if len(working) != 1 else ' is'} working."
+                    )
+                elif idle:
+                    names = ", ".join(e.name for e in idle[:3])
+                    lines.append(
+                        f"Crew ready: {len(idle)} idle"
+                        f"{' engineers' if len(idle) != 1 else ' engineer'}"
+                        f" ({names})."
+                    )
+                elif not employees:
+                    lines.append("Crew: no engineers hired yet.")
+
+                rm = company.active_roadmap
+                if rm:
+                    lines.append(
+                        f"Roadmap: {rm.done_count}/{rm.total_count} done"
+                        f" ({rm.state.value})."
+                    )
+
+        if not wants_repo:
+            if not employees and not company.active_roadmap:
+                lines.append("Team is idle. No active roadmap yet.")
+            else:
+                if working:
+                    names = ", ".join(e.name for e in working[:3])
+                    lines.append(
+                        f"Working now: {names}"
+                        f"{' are' if len(working) != 1 else ' is'} in flight."
+                    )
+                elif idle:
+                    names = ", ".join(e.name for e in idle[:4])
+                    lines.append(
+                        f"Crew ready: {len(idle)} idle"
+                        f"{' engineers' if len(idle) != 1 else ' engineer'}"
+                        f" ({names})."
+                    )
+                else:
+                    lines.append("No engineers hired yet.")
+
+                if blocked:
+                    lines.append(
+                        "Blocked: " + ", ".join(e.name for e in blocked[:3]) + "."
+                    )
+
+                rm = company.active_roadmap
+                if rm:
+                    lines.append(
+                        f"Roadmap: {rm.done_count}/{rm.total_count} done"
+                        f" ({rm.state.value})."
+                    )
+
+                if self._events:
+                    latest = self._events[-1]
+                    lines.append(
+                        f"Latest event: {latest.get('kind', 'activity')} "
+                        f"{latest.get('name', '')}".strip() + "."
+                    )
+
+        project_summary = self.project_info.summary
+        if project_summary and not wants_repo:
+            lines.append(f"Project: {project_summary}.")
+
+        return "\n".join(lines)
+
     # ------------------------------------------------------------------
     # Intent handlers — greeting, pause, stop, resume
     # ------------------------------------------------------------------
 
     def _handle_greeting(self, text: str) -> str:
-        """Handle casual greetings without triggering any work.
+        """Handle casual greetings \u2014 reflect company state naturally.
 
-        Context-aware: reflects actual company state naturally.
-        Never resumes paused work — just acknowledges it.
+        Never resumes paused work. Never triggers execution.
         """
-        import random
-
         has_employees = any(
             e.role != "cto" for e in self.company.employees.values()
         )
         has_cto = self.company.get_cto() is not None
 
-        # Check for paused/interrupted roadmap
         roadmap = self.company.active_roadmap
-        paused_desc = None
         if roadmap and roadmap.state in (
             RoadmapState.PAUSED, RoadmapState.INTERRUPTED,
         ):
-            paused_desc = roadmap.paused_task_description
-
-        if paused_desc:
-            short = paused_desc[:50]
+            short = (roadmap.paused_task_description or "")[:50]
             return (
-                f"We have a paused roadmap on **{short}** "
+                f"Roadmap paused on **{short}** "
                 f"({roadmap.done_count}/{roadmap.total_count} done). "
-                f"Type `continue` to pick up, or tell me what's next."
+                f"`continue` to pick up, or tell me what's changed."
             )
 
         if not has_cto and not has_employees:
-            openers = [
-                "Tell me what we're building.",
-                "What's the project?",
-                "Ready when you are. What do we need?",
-            ]
-            return random.choice(openers)
+            return "What are we building?"
 
         if has_employees:
             working = [
@@ -954,13 +1253,21 @@ class Router:
             ]
             if working:
                 names = ", ".join(e.name for e in working[:3])
-                return f"{names} {'is' if len(working) == 1 else 'are'} on it. What do you need?"
+                return (
+                    f"{names} {'is' if len(working) == 1 else 'are'} on it. "
+                    f"What do you need?"
+                )
             if idle:
-                count = len(idle)
-                return f"Team's here — {count} engineer{'s' if count != 1 else ''} idle. What's next?"
+                if len(idle) <= 3:
+                    names = ", ".join(e.name for e in idle)
+                    return (
+                        f"{names} {'is' if len(idle) == 1 else 'are'} free. "
+                        f"What's next?"
+                    )
+                return f"{len(idle)} engineers standing by. What's the play?"
             return "What do you need?"
 
-        return "What are we working on?"
+        return "What are we building?"
 
     def _handle_pause(self) -> str:
         """Gracefully pause the active roadmap at a safe point."""
@@ -980,6 +1287,7 @@ class Router:
                 from shipwright.company.employee import RoadmapTaskStatus
                 t.status = RoadmapTaskStatus.PENDING
         desc = roadmap.paused_task_description or "current work"
+        self._log_event("pause", detail=desc[:80])
         return (
             f"**Paused.** Roadmap stopped at a safe point.\n"
             f"Next up: {desc}\n"
@@ -1004,6 +1312,7 @@ class Router:
                 from shipwright.company.employee import RoadmapTaskStatus
                 t.status = RoadmapTaskStatus.PENDING
         desc = roadmap.paused_task_description or "current work"
+        self._log_event("pause", detail=desc[:80])
         return (
             f"**Interrupted.** Roadmap halted immediately.\n"
             f"Was working on: {desc}\n"
@@ -1028,6 +1337,7 @@ class Router:
                 t.output_summary = "Cancelled by user"
         done = roadmap.done_count
         total = roadmap.total_count
+        self._log_event("stop", detail=f"{done}/{total} done")
         return (
             f"**Stopped.** Roadmap cancelled ({done}/{total} tasks were done).\n"
             f"History preserved. Start a new task whenever you're ready."
@@ -1065,6 +1375,7 @@ class Router:
                 break
         roadmap.paused = False
         roadmap.state = RoadmapState.RUNNING
+        self._log_event("resume", detail=(roadmap.paused_task_description or "")[:80])
         result = await self.company.execute_roadmap(
             on_text=on_text,
             on_delegation_start=on_delegation_start,
@@ -1078,18 +1389,61 @@ class Router:
     # ------------------------------------------------------------------
 
     def _roadmap_status(self) -> str:
-        """Show the current roadmap status with context."""
+        """Task board view of the current roadmap."""
         roadmap = self.company.active_roadmap
         if not roadmap:
-            return "No active roadmap. Ask the CTO to build something."
+            return "No active roadmap. Tell the CTO what to build."
+
+        from shipwright.company.employee import RoadmapTaskStatus
+
         lines = []
         if roadmap.original_request:
-            lines.append(f"**Roadmap** \u2014 {roadmap.original_request[:60]}\n")
-        lines.append(roadmap.status_display())
+            lines.append(f"**Tasks** \u2014 {roadmap.original_request[:55]}\n")
+        else:
+            lines.append("**Tasks**\n")
+
+        state_tag = ""
+        if roadmap.state == RoadmapState.PAUSED:
+            state_tag = " \u2014 PAUSED"
+        elif roadmap.state == RoadmapState.INTERRUPTED:
+            state_tag = " \u2014 INTERRUPTED"
+        elif roadmap.state == RoadmapState.STOPPED:
+            state_tag = " \u2014 STOPPED"
+        elif roadmap.state == RoadmapState.RUNNING:
+            state_tag = " \u2014 running"
+
+        lines.append(f"  {roadmap.done_count}/{roadmap.total_count} done{state_tag}")
+        lines.append(f"  {'\u2500' * 48}")
+
+        for t in roadmap.tasks:
+            icon = {
+                "pending": "[ ]",
+                "running": "[~]",
+                "done": "[x]",
+                "failed": "[!]",
+            }[t.status.value]
+
+            suffix = ""
+            if t.status == RoadmapTaskStatus.PENDING:
+                idx = roadmap.current_task_index or 0
+                if roadmap.state == RoadmapState.PAUSED and t.index == idx:
+                    suffix = "  \u2190 paused here"
+                elif roadmap.state == RoadmapState.INTERRUPTED and t.index == idx:
+                    suffix = "  \u2190 interrupted here"
+
+            lines.append(f"  {icon} {t.index}. {t.description}{suffix}")
+            if t.output_summary:
+                lines.append(f"       {t.output_summary[:70]}")
+
+        lines.append(f"  {'\u2500' * 48}")
+
         if roadmap.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
-            lines.append(f"\nType `continue` to resume, `stop` to cancel.")
+            lines.append("\n  Type `continue` to resume, `stop` to cancel.")
+        elif roadmap.state == RoadmapState.STOPPED:
+            lines.append("\n  Roadmap cancelled. Start a new task.")
         elif not roadmap.approved:
-            lines.append(f"\nType `go` to start execution.")
+            lines.append("\n  Type `go` to start execution.")
+
         return "\n".join(lines)
 
     async def _roadmap_approve(
@@ -1161,9 +1515,11 @@ class Router:
             return f"No session named '{name}' found. No saved sessions exist."
 
         try:
-            self.company = Company.from_dict(data.get("company", {}), self.config)
-            self.session = Session.from_dict(data.get("session", {"id": name}))
+            restored = Router.from_dict(data, self.config)
+            self.company = restored.company
+            self.session = restored.session
             self.session_name = name
+            self._events = restored._events
         except Exception as e:
             logger.error("Failed to restore session '%s': %s", name, e)
             return (
@@ -1184,6 +1540,7 @@ class Router:
                 # Nothing to lose — just clear
                 self.company = Company(config=self.config)
                 self.session = Session(id=self.session.id)
+                self._events = []
                 return "Session cleared."
             return (
                 f"Clear session? This will dismiss all {n} employee(s) "
@@ -1192,6 +1549,7 @@ class Router:
             )
         self.company = Company(config=self.config)
         self.session = Session(id=self.session.id)
+        self._events = []
         return "Session cleared. All employees dismissed."
 
     # ------------------------------------------------------------------
@@ -1203,6 +1561,7 @@ class Router:
             "session": self.session.to_dict(),
             "company": self.company.to_dict(),
             "session_name": self.session_name,
+            "events": self._events[-50:],
         }
         if self.config.budget_limit_usd > 0:
             data["budget_limit_usd"] = self.config.budget_limit_usd
@@ -1223,5 +1582,7 @@ class Router:
         # Backward compat: handle old crew-based state
         elif "crews" in data:
             logger.warning("Old crew-based state detected; ignoring.")
+
+        router._restore_events(data.get("events"))
 
         return router

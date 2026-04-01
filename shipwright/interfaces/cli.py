@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 import re
 import signal
 import sys
@@ -20,6 +21,7 @@ from shipwright.company.employee import EmployeeStatus, RoadmapState
 from shipwright.company.roles import list_roles
 from shipwright.persistence.store import load_state, save_state
 from shipwright.utils.logging import get_logger
+from shipwright.workspace.git import GitError, get_current_branch, get_status
 
 logger = get_logger("interfaces.cli")
 
@@ -102,6 +104,19 @@ ICON_HIRE = "+"
 ICON_ARROW = "\u2192"      # →
 ICON_DOT = "\u00b7"        # ·
 
+# Status-specific colors for the control room
+STATUS_WORKING = f"{BOLD}{BR_YELLOW}"
+STATUS_IDLE = DIM
+STATUS_BLOCKED = f"{BOLD}{BR_RED}"
+STATUS_ONLINE = BR_CYAN
+HEADER_COLOR = f"{BOLD}{BR_WHITE}"
+
+# Roster icons
+ICON_CTO = "\u25c6"        # ◆
+ICON_IDLE = "\u25cb"        # ○  (reuses ICON_PENDING glyph)
+ICON_BLOCKED = "\u25a0"    # ■
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -127,55 +142,437 @@ def _term_width() -> int:
         return 80
 
 
+def _visible_len(text: str) -> int:
+    """Return the display width of a string after stripping ANSI codes."""
+    return len(ANSI_RE.sub("", text))
+
+
+def _pad_visible(text: str, width: int) -> str:
+    """Pad a line to the requested visible width."""
+    text = _truncate_visible(text, width)
+    pad = max(width - _visible_len(text), 0)
+    return text + (" " * pad)
+
+
+def _truncate_visible(text: str, width: int) -> str:
+    """Truncate text to a visible width without stripping ANSI codes."""
+    if width <= 0 or _visible_len(text) <= width:
+        return text
+
+    out: list[str] = []
+    visible = 0
+    i = 0
+    limit = max(width - 1, 0)
+
+    while i < len(text) and visible < limit:
+        if text[i] == "\x1b":
+            match = ANSI_RE.match(text, i)
+            if match:
+                out.append(match.group(0))
+                i = match.end()
+                continue
+        out.append(text[i])
+        visible += 1
+        i += 1
+
+    out.append("…")
+    if "\x1b[" in text:
+        out.append(RESET)
+    return "".join(out)
+
+
+def _panel_width() -> int:
+    """Inner content width for control-room panels."""
+    return max(34, min(_term_width() - 8, 86))
+
+
+def _render_panel(title: str, rows: list[str], accent: str = HEADER_COLOR) -> str:
+    """Render a consistent width-aware panel."""
+    content_width = _panel_width()
+    title_text = f" {title} "
+    top_fill = max(content_width + 2 - len(title_text), 0)
+
+    lines = [
+        f"  {DIM}╭{RESET}{accent}{title_text}{RESET}{DIM}{'─' * top_fill}╮{RESET}",
+    ]
+
+    for row in rows:
+        lines.append(
+            f"  {DIM}│{RESET} {_pad_visible(row, content_width)} {DIM}│{RESET}"
+        )
+
+    lines.append(f"  {DIM}╰{'─' * (content_width + 2)}╯{RESET}")
+    return "\n".join(lines)
+
+
+def _repo_snapshot(config: Config) -> tuple[str, str, str]:
+    """Return repo name, branch, and working tree summary for the header."""
+    repo_name = Path(config.repo_root).name or str(config.repo_root)
+
+    try:
+        branch = get_current_branch(config.repo_root)
+    except GitError:
+        branch = "n/a"
+
+    try:
+        changed = len([line for line in get_status(config.repo_root).splitlines() if line.strip()])
+        tree = "clean" if changed == 0 else f"{changed} changed"
+    except GitError:
+        tree = "git unavailable"
+
+    return repo_name, branch, tree
+
+
+def _roadmap_tag(company) -> str:
+    """Build a concise roadmap tag for headers and footers."""
+    rm = company.active_roadmap if company else None
+    if not rm:
+        return "no roadmap"
+    if rm.state == RoadmapState.RUNNING:
+        state = "running"
+    elif rm.state == RoadmapState.PAUSED:
+        state = "paused"
+    elif rm.state == RoadmapState.INTERRUPTED:
+        state = "interrupted"
+    elif rm.state == RoadmapState.STOPPED:
+        state = "stopped"
+    else:
+        state = rm.state.value
+    return f"roadmap {rm.done_count}/{rm.total_count} {state}"
+
+
+def _render_control_header(router: Router, session_name: str) -> str:
+    """Render the top-level control-room summary card."""
+    company = router.company
+    repo_name, branch, tree = _repo_snapshot(router.config)
+    active = company.active_employee.name if company and company.active_employee else "CTO standby"
+    emp_count = len([e for e in company.employees.values() if e.role != "cto"]) if company else 0
+
+    rows = [
+        f"{BOLD}{BR_CYAN}shipwright{RESET} {DIM}control room{RESET}",
+        (
+            f"{DIM}repo{RESET} {repo_name}  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}branch{RESET} {branch}  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}tree{RESET} {tree}"
+        ),
+        (
+            f"{DIM}session{RESET} {session_name}  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}active{RESET} {active}  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}crew{RESET} {emp_count}"
+        ),
+        (
+            f"{DIM}mode{RESET} autopilot  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}state{RESET} {_roadmap_tag(company)}"
+        ),
+    ]
+
+    if company and company.is_stale:
+        rows.append(f"{YELLOW}{ICON_WARN} stale worktree detected{RESET}")
+
+    return _render_panel("COMMAND BRIDGE", rows, accent=f"{BOLD}{BR_CYAN}")
+
+
+def _render_operator_hints(router: Router) -> str:
+    """Render state-aware next-step hints."""
+    company = router.company
+    employees = [e for e in company.employees.values() if e.role != "cto"]
+    rm = company.active_roadmap
+
+    if rm and rm.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
+        rows = [
+            f"{DIM}resume{RESET} continue  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}inspect{RESET} tasks / events  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}abort{RESET} stop",
+        ]
+    elif not employees:
+        rows = [
+            "Tell the CTO what to build, or hire directly with `hire backend-dev`.",
+            f"{DIM}good probes{RESET} build auth flow  {DIM}{ICON_DOT}{RESET}  "
+            f"fix failing tests  {DIM}{ICON_DOT}{RESET}  review repo state",
+        ]
+    elif rm and rm.state == RoadmapState.RUNNING:
+        rows = [
+            f"{DIM}watch{RESET} who / tasks / events  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}interrupt{RESET} pause  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}steer{RESET} give the CTO a new directive",
+        ]
+    else:
+        rows = [
+            f"{DIM}crew{RESET} who  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}board{RESET} tasks  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}feed{RESET} events  {DIM}{ICON_DOT}{RESET}  "
+            f"{DIM}help{RESET} help",
+        ]
+
+    return _render_panel("OPS", rows, accent=BR_YELLOW)
+
+
+def _render_session_panel(router: Router) -> str:
+    """Render a session-focused control card."""
+    company = router.company
+    session_name = getattr(router, "session_name", "default")
+    active = company.active_employee.name if company and company.active_employee else "CTO standby"
+    message_count = len(router.session.messages) if router and router.session else 0
+    event_count = len(getattr(router, "_events", []))
+    cwd = Path(router.config.repo_root).name or str(router.config.repo_root)
+
+    rows = [
+        f"{DIM}session{RESET} {session_name}",
+        f"{DIM}workspace{RESET} {cwd}",
+        f"{DIM}messages{RESET} {message_count}",
+        f"{DIM}events{RESET} {event_count}",
+        f"{DIM}active{RESET} {active}",
+    ]
+
+    return _render_panel("SESSION", rows, accent=BR_GREEN)
+
+
+def _render_roadmap_panel(router: Router) -> str:
+    """Render a roadmap card showing task execution status."""
+    company = router.company
+    rm = company.active_roadmap if company else None
+
+    if not rm:
+        rows = [
+            "No active roadmap.",
+            f"{DIM}Ask the CTO for a plan, or use `go` after a plan appears.{RESET}",
+        ]
+        return _render_panel("ROADMAP", rows, accent=BR_CYAN)
+
+    if rm.state == RoadmapState.RUNNING:
+        state_line = f"{BR_GREEN}running{RESET}"
+    elif rm.state == RoadmapState.PAUSED:
+        state_line = f"{YELLOW}paused{RESET}"
+    elif rm.state == RoadmapState.INTERRUPTED:
+        state_line = f"{BR_RED}interrupted{RESET}"
+    elif rm.state == RoadmapState.STOPPED:
+        state_line = f"{RED}stopped{RESET}"
+    else:
+        state_line = rm.state.value
+
+    rows = [
+        f"{DIM}request{RESET} {_truncate_visible(rm.original_request or 'No request recorded.', _panel_width() - 10)}",
+        f"{DIM}progress{RESET} {rm.done_count}/{rm.total_count} {state_line}",
+    ]
+
+    if rm.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
+        rows.append(f"{DIM}action{RESET} continue / stop")
+    elif rm.state == RoadmapState.RUNNING:
+        rows.append(f"{DIM}action{RESET} watch tasks move forward")
+    elif rm.state == RoadmapState.STOPPED:
+        rows.append(f"{DIM}action{RESET} start a new request")
+    elif not rm.approved:
+        rows.append(f"{DIM}action{RESET} go / approve to start")
+
+    task_rows: list[str] = []
+    for task in rm.tasks[:6]:
+        icon = {
+            "pending": ICON_PENDING,
+            "running": ICON_TASK,
+            "done": ICON_DONE,
+            "failed": ICON_FAIL,
+        }[task.status.value]
+        state_color = {
+            "pending": DIM,
+            "running": BR_YELLOW,
+            "done": GREEN,
+            "failed": RED,
+        }[task.status.value]
+        prefix = "↳ " if rm.current_task_index == task.index and task.status.value == "running" else ""
+        suffix = ""
+        if rm.state == RoadmapState.PAUSED and task.index == (rm.current_task_index or 0):
+            suffix = "  paused here"
+        elif rm.state == RoadmapState.INTERRUPTED and task.index == (rm.current_task_index or 0):
+            suffix = "  interrupted here"
+        task_rows.append(
+            f"{state_color}{icon}{RESET} {task.index}. {prefix}{_truncate_visible(task.description, _panel_width() - 12)}{suffix}"
+        )
+
+    if task_rows:
+        rows.append("")
+        rows.extend(task_rows)
+        if len(rm.tasks) > len(task_rows):
+            rows.append(f"{DIM}... and {len(rm.tasks) - len(task_rows)} more task(s){RESET}")
+
+    return _render_panel("ROADMAP", rows, accent=BR_CYAN)
+
+
+# ---------------------------------------------------------------------------
+# Crew roster — live panel showing everyone and their current state
+# ---------------------------------------------------------------------------
+def _render_roster(company) -> str:
+    """Render the crew roster panel with ANSI colors.
+
+    Used at startup and in direct-render contexts (not through the markdown
+    pipeline).
+    """
+    if not company or not company.employees:
+        return ""
+
+    lines: list[str] = []
+
+    # CTO
+    cto = company.get_cto()
+    if cto:
+        if cto.status == EmployeeStatus.WORKING:
+            lines.append(
+                f"  {STATUS_ONLINE}{ICON_CTO}{RESET}  {BOLD}CTO{RESET}"
+                f"  {STATUS_WORKING}working{RESET}"
+            )
+        else:
+            lines.append(
+                f"  {STATUS_ONLINE}{ICON_CTO}{RESET}  {BOLD}CTO{RESET}"
+                f"  {STATUS_ONLINE}online{RESET}"
+            )
+
+    # Other employees
+    for emp in company.employees.values():
+        if emp.role == "cto":
+            continue
+
+        rc = role_color(emp.role)
+
+        if emp.status == EmployeeStatus.WORKING:
+            icon = f"{BR_YELLOW}{ICON_TASK}{RESET}"
+            task_desc = (
+                emp.current_task.description.split("\n")[0][:30]
+                if emp.current_task else "..."
+            )
+            elapsed = ""
+            if emp.current_task and emp.current_task.created_at:
+                secs = time.time() - emp.current_task.created_at
+                elapsed = f"  {DIM}{_format_elapsed(secs)}{RESET}"
+            status_part = f"{YELLOW}{task_desc}{RESET}{elapsed}"
+        elif emp.status == EmployeeStatus.BLOCKED:
+            icon = f"{BR_RED}{ICON_BLOCKED}{RESET}"
+            status_part = f"{BR_RED}blocked{RESET}"
+        else:
+            icon = f"{DIM}{ICON_IDLE}{RESET}"
+            nt = len(emp.task_history)
+            if nt:
+                status_part = f"{DIM}idle {ICON_DOT} {nt}t{RESET}"
+            else:
+                status_part = f"{DIM}idle{RESET}"
+
+        lines.append(
+            f"{icon}  {rc}{emp.name}{RESET} {DIM}{ICON_DOT}{RESET} "
+            f"{DIM}{emp.display_role}{RESET}  {status_part}"
+        )
+
+    return _render_panel("CREW", lines)
+
+
+# ---------------------------------------------------------------------------
+# Event log — recent activity feed for direct display
+# ---------------------------------------------------------------------------
+def _render_event_log(events: list[dict], limit: int = 5) -> str:
+    """Render recent events with ANSI colors for direct display."""
+    if not events:
+        return ""
+
+    from datetime import datetime
+
+    lines: list[str] = []
+
+    _ICONS = {
+        "hire": f"{BR_GREEN}+{RESET}",
+        "fire": f"{RED}\u2212{RESET}",
+        "delegate": f"{BR_YELLOW}{ICON_DELEGATE}{RESET}",
+        "done": f"{GREEN}{ICON_DONE}{RESET}",
+        "fail": f"{RED}{ICON_FAIL}{RESET}",
+        "pause": f"{YELLOW}\u2016{RESET}",
+        "resume": f"{BR_GREEN}{ICON_DELEGATE}{RESET}",
+        "stop": f"{RED}{ICON_BLOCKED}{RESET}",
+    }
+
+    for ev in events[-limit:]:
+        ts = datetime.fromtimestamp(ev["ts"]).strftime("%H:%M")
+        icon = _ICONS.get(ev["kind"], f"{DIM}{ICON_DOT}{RESET}")
+        name = ev.get("name", "")
+        detail = ev.get("detail", "")
+
+        if ev["kind"] == "hire":
+            text = f"Hired {name} as {detail}"
+        elif ev["kind"] == "fire":
+            text = f"Dismissed {name}"
+        elif ev["kind"] == "delegate":
+            text = f"{name} {ICON_ARROW} {detail}"
+        elif ev["kind"] == "done":
+            text = f"{name} done  {DIM}{detail}{RESET}"
+        elif ev["kind"] == "fail":
+            text = f"{name} {RED}failed{RESET}  {DIM}{detail}{RESET}"
+        elif ev["kind"] == "pause":
+            text = "Roadmap paused"
+        elif ev["kind"] == "resume":
+            text = "Roadmap resumed"
+        elif ev["kind"] == "stop":
+            text = "Roadmap stopped"
+        else:
+            text = f"{name} {detail}".strip()
+
+        lines.append(f"{DIM}{ts}{RESET}  {icon} {text}")
+
+    return _render_panel("EVENTS", lines)
+
+
 # ---------------------------------------------------------------------------
 # Status strip — compact one-line company state above the prompt
 # ---------------------------------------------------------------------------
 def _render_status_strip(router: Router) -> str:
-    """Render a compact, dim status strip above the prompt."""
+    """Render a compact status strip above the prompt with color accents."""
     company = router.company
     if not company:
         return ""
 
-    parts: list[str] = []
+    segments: list[str] = []
 
     # CTO status
     cto = company.get_cto()
     if cto:
-        parts.append("CTO")
+        segments.append(f"{DIM}CTO{RESET}")
     else:
-        parts.append("CTO offline")
+        segments.append(f"{DIM}CTO offline{RESET}")
 
-    # Employee count (excluding CTO)
+    # Employee count — highlight working in yellow
     n_emp = len([e for e in company.employees.values() if e.role != "cto"])
     if n_emp:
         working = [e for e in company.employees.values()
                    if e.status == EmployeeStatus.WORKING and e.role != "cto"]
         if working:
-            parts.append(f"{len(working)}/{n_emp} working")
+            segments.append(
+                f"{BR_YELLOW}{len(working)}{RESET}"
+                f"{DIM}/{n_emp} working{RESET}"
+            )
         else:
-            parts.append(f"{n_emp} idle")
+            segments.append(f"{DIM}{n_emp} idle{RESET}")
 
     # Roadmap progress
     rm = company.active_roadmap
     if rm:
         if rm.state == RoadmapState.RUNNING:
-            parts.append(f"roadmap {rm.done_count}/{rm.total_count}")
+            segments.append(
+                f"{DIM}roadmap {rm.done_count}/{rm.total_count}{RESET}"
+            )
         elif rm.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
             label = "paused" if rm.state == RoadmapState.PAUSED else "interrupted"
-            parts.append(f"roadmap {rm.done_count}/{rm.total_count} {label}")
+            segments.append(f"{YELLOW}roadmap {label}{RESET}")
         elif rm.state == RoadmapState.STOPPED:
-            parts.append("roadmap stopped")
+            segments.append(f"{DIM}roadmap stopped{RESET}")
+
+    events = len(getattr(router, "_events", []))
+    if events:
+        segments.append(f"{DIM}events {events}{RESET}")
 
     # Session tag
     session_name = getattr(router, "session_name", "default")
     if session_name != "default":
-        parts.append(session_name)
+        segments.append(f"{DIM}{session_name}{RESET}")
 
-    if not parts:
+    if not segments:
         return ""
 
-    sep = f" {ICON_DOT} "
-    return f"  {DIM}{sep.join(parts)}{RESET}"
+    sep = f" {DIM}{ICON_DOT}{RESET} "
+    return f"  {sep.join(segments)}"
 
 
 # Commands recognised by the REPL (for tab completion)
@@ -200,6 +597,7 @@ _COMMANDS = [
     "pause now",
     "promote",
     "quit",
+    "repo",
     "resume",
     "roadmap",
     "roles",
@@ -213,6 +611,7 @@ _COMMANDS = [
     "status",
     "stop",
     "talk",
+    "tasks",
     "team",
     "team create",
     "who",
@@ -282,6 +681,8 @@ class CLIOutput:
         self._start_time: float = 0.0
         self._company = company
         self._event_count = 0
+        self._speaker_label: str | None = None
+        self._speaker_role: str | None = None
 
     def _get_role_for_name(self, name: str) -> str:
         """Look up role_id for an employee name."""
@@ -302,14 +703,20 @@ class CLIOutput:
             self.spinner.stop()
         if not self._got_text:
             self._got_text = True
-            sys.stdout.write(f"\n  {CYAN}")
+            if self._speaker_label:
+                color = role_color(self._speaker_role or "cto")
+                sys.stdout.write(
+                    f"\n  {color}[{self._speaker_label}]{RESET} {CYAN}"
+                )
+            else:
+                sys.stdout.write(f"\n  {CYAN}")
         sys.stdout.write(text)
         sys.stdout.flush()
 
     def on_delegation_start(
         self, member_name: str, task: str, round_num: int, max_rounds: int
     ) -> None:
-        """Called when an employee starts working — quiet event line."""
+        """Called when an employee starts working — colored event line."""
         if self.spinner.active:
             self.spinner.stop()
         sys.stdout.write(RESET)
@@ -318,12 +725,18 @@ class CLIOutput:
         display_name = member_name.replace("_", " ").title()
         short_task = task.split("\n")[0][:55]
 
+        # Look up role color for the employee
+        rc = ""
+        if self._company and member_name in self._company.employees:
+            rc = role_color(self._company.employees[member_name].role)
+
         round_tag = ""
         if round_num > 1:
-            round_tag = f" r{round_num}"
+            round_tag = f" {DIM}r{round_num}{RESET}"
 
         sys.stdout.write(
-            f"\n    {DIM}{display_name} {ICON_ARROW} {short_task}{round_tag}{RESET}\n"
+            f"\n    {rc}{display_name}{RESET} {DIM}{ICON_ARROW}{RESET} "
+            f"{DIM}{short_task}{RESET}{round_tag}\n"
         )
         sys.stdout.flush()
         self._event_count += 1
@@ -332,21 +745,27 @@ class CLIOutput:
     def on_delegation_end(
         self, member_name: str, duration_s: float, is_error: bool
     ) -> None:
-        """Called when an employee finishes — quiet result with timing."""
+        """Called when an employee finishes — colored result with timing."""
         if self.spinner.active:
             self.spinner.stop()
 
         display_name = member_name.replace("_", " ").title()
         time_str = _format_elapsed(duration_s)
 
+        # Look up role color for the employee
+        rc = ""
+        if self._company and member_name in self._company.employees:
+            rc = role_color(self._company.employees[member_name].role)
+
         if is_error:
             sys.stdout.write(
-                f"    {DIM}{display_name}{RESET} {RED}failed{RESET}"
-                f" {DIM}{time_str}{RESET}\n"
+                f"    {rc}{display_name}{RESET} {BOLD}{RED}failed{RESET}"
+                f"  {DIM}{time_str}{RESET}\n"
             )
         else:
             sys.stdout.write(
-                f"    {DIM}{display_name} {GREEN}done{DIM}  {time_str}{RESET}\n"
+                f"    {rc}{display_name}{RESET} {GREEN}done{RESET}"
+                f"  {DIM}{time_str}{RESET}\n"
             )
         sys.stdout.flush()
         self._event_count += 1
@@ -364,11 +783,17 @@ class CLIOutput:
 
     # -- lifecycle ----------------------------------------------------------
 
-    def start_thinking(self) -> None:
+    def start_thinking(
+        self,
+        speaker_label: str | None = None,
+        speaker_role: str | None = None,
+    ) -> None:
         """Call before sending a message to the router."""
         self._got_text = False
         self._start_time = time.time()
         self._event_count = 0
+        self._speaker_label = speaker_label
+        self._speaker_role = speaker_role
         self.spinner.start("Thinking...")
 
     def finish_response(self) -> None:
@@ -432,6 +857,26 @@ def _colorize_status(line: str) -> str:
     line = line.replace("← paused here", f"{YELLOW}← paused here{RESET}")
     line = line.replace("← interrupted here", f"{BR_RED}← interrupted here{RESET}")
 
+    # Roster and event feed icons (from who/tasks/events commands)
+    if "\u25cf " in line:
+        line = line.replace("\u25cf ", f"{BR_YELLOW}\u25cf{RESET} ")
+    if "\u25cb " in line:
+        line = line.replace("\u25cb ", f"{DIM}\u25cb{RESET} ")
+    if "\u25c6 " in line:
+        line = line.replace("\u25c6 ", f"{BR_CYAN}\u25c6{RESET} ")
+    if "\u25a0 " in line:
+        line = line.replace("\u25a0 ", f"{RED}\u25a0{RESET} ")
+    if "\u25b6 " in line:
+        line = line.replace("\u25b6 ", f"{BR_YELLOW}\u25b6{RESET} ")
+    if "\u2713 " in line:
+        line = line.replace("\u2713 ", f"{GREEN}\u2713{RESET} ")
+    if "\u2717 " in line:
+        line = line.replace("\u2717 ", f"{RED}\u2717{RESET} ")
+    if "\u2016 " in line:
+        line = line.replace("\u2016 ", f"{YELLOW}\u2016{RESET} ")
+    if "\u2212 " in line:
+        line = line.replace("\u2212 ", f"{RED}\u2212{RESET} ")
+
     return line
 
 
@@ -460,6 +905,35 @@ def render_markdown(text: str) -> str:
         # Horizontal rule
         if stripped and len(stripped) >= 3 and all(c in "-*_" for c in stripped):
             output.append(f"  {DIM}{'\u2500' * 50}{RESET}")
+            continue
+
+        # Blockquote
+        if stripped.startswith("> "):
+            content = stripped[2:]
+            content = re.sub(r"\*\*(.+?)\*\*", rf"{BOLD}\1{RESET}", content)
+            content = re.sub(r"`([^`]+)`", rf"{DIM}\1{RESET}", content)
+            content = _colorize_status(content)
+            output.append(f"  {BR_CYAN}▌{RESET} {DIM}{content}{RESET}")
+            continue
+
+        # Lists
+        bullet_match = re.match(r"^([-*+])\s+(.+)$", stripped)
+        if bullet_match:
+            content = bullet_match.group(2)
+            content = re.sub(r"\*\*(.+?)\*\*", rf"{BOLD}\1{RESET}", content)
+            content = re.sub(r"`([^`]+)`", rf"{DIM}\1{RESET}", content)
+            content = _colorize_status(content)
+            output.append(f"  {DIM}•{RESET} {content}")
+            continue
+
+        ordered_match = re.match(r"^(\d+)\.\s+(.+)$", stripped)
+        if ordered_match:
+            number = ordered_match.group(1)
+            content = ordered_match.group(2)
+            content = re.sub(r"\*\*(.+?)\*\*", rf"{BOLD}\1{RESET}", content)
+            content = re.sub(r"`([^`]+)`", rf"{DIM}\1{RESET}", content)
+            content = _colorize_status(content)
+            output.append(f"  {BOLD}{number}.{RESET} {content}")
             continue
 
         # Headers
@@ -548,43 +1022,33 @@ def _setup_completer(router: Router) -> None:
 # Startup display
 # ---------------------------------------------------------------------------
 def _print_startup(router: Router, session_name: str) -> None:
-    """Print a minimal, composed startup screen."""
+    """Print the control-room startup screen with crew roster."""
     print()
-    print(f"  {BOLD}{BR_CYAN}shipwright{RESET}")
+    print(_render_control_header(router, session_name))
+    print()
+    print(_render_operator_hints(router))
+    print()
+    print(_render_session_panel(router))
 
     company = router.company
-    cto = company.get_cto() if company else None
-    n_emp = len([e for e in company.employees.values() if e.role != "cto"]) if company else 0
 
-    if cto or n_emp:
-        # Restored session — one compact state line
-        parts: list[str] = []
-        if cto:
-            parts.append("CTO")
-        if n_emp:
-            working = [e for e in company.employees.values()
-                       if e.status == EmployeeStatus.WORKING and e.role != "cto"]
-            if working:
-                parts.append(f"{len(working)} working")
-            else:
-                parts.append(f"{n_emp} idle")
+    # Show roster if there are employees
+    if company and company.employees:
+        print()
+        print(_render_roster(company))
 
-        sep = f" {ICON_DOT} "
-        print(f"  {DIM}{sep.join(parts)}{RESET}")
+    print()
+    print(_render_roadmap_panel(router))
 
-        # Roadmap state (if noteworthy)
-        rm = company.active_roadmap
-        if rm and rm.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
-            label = "paused" if rm.state == RoadmapState.PAUSED else "interrupted"
-            print(f"  {DIM}Roadmap {rm.done_count}/{rm.total_count} {label}{RESET}")
-        elif rm and rm.state == RoadmapState.RUNNING:
-            print(f"  {DIM}Roadmap {rm.done_count}/{rm.total_count} running{RESET}")
+    # Recent events (from restored session)
+    events = getattr(router, "_events", [])
+    if events:
+        print()
+        print(_render_event_log(events, limit=5))
 
-        if company.is_stale:
-            print(f"  {DIM}{ICON_WARN} Stale worktree{RESET}")
-
-        if session_name != "default":
-            print(f"  {DIM}{session_name}{RESET}")
+    if company and company.is_stale:
+        print()
+        print(f"  {YELLOW}{ICON_WARN} Stale worktree{RESET}")
 
     print()
 
@@ -598,13 +1062,51 @@ def _build_prompt(router: Router) -> str:
     if active:
         color = role_color(active.role)
         if active.role == "cto":
-            return f"{BOLD}{BR_CYAN}CTO{RESET} {DIM}\u203a{RESET} "
+            return f"{BOLD}{BR_CYAN}[CTO]{RESET} {DIM}\u203a{RESET} "
         else:
             return (
-                f"{color}{active.name}{RESET}"
-                f" {DIM}({active.display_role}) \u203a{RESET} "
+                f"{color}[{active.name}]{RESET}"
+                f" {DIM}{active.display_role} \u203a{RESET} "
             )
-    return f"{BOLD}{BR_CYAN}shipwright{RESET} {DIM}\u203a{RESET} "
+    return f"{BOLD}{BR_CYAN}[CTO]{RESET} {DIM}\u203a{RESET} "
+
+
+def _response_identity(router: Router, text: str) -> tuple[str, str]:
+    """Infer the likely responding party for streamed output framing."""
+    at_match = re.match(r'^@(\w+)\s+(.+)$', text.strip(), re.DOTALL)
+    if at_match:
+        resolved = router._resolve_name(at_match.group(1))
+        if resolved and resolved in router.company.employees:
+            emp = router.company.employees[resolved]
+            return emp.name, emp.role
+
+    active = router.company.active_employee if router.company else None
+    if active:
+        return active.name, active.role
+    return "CTO", "cto"
+
+
+def _render_cycle_footer(ui: CLIOutput, router: Router) -> str:
+    """Render a compact footer after each response cycle."""
+    segments: list[str] = []
+
+    if ui._event_count:
+        segments.append(f"{ui._event_count} ops")
+    if ui.elapsed >= 0.5:
+        segments.append(_format_elapsed(ui.elapsed))
+
+    rm = router.company.active_roadmap if router.company else None
+    if rm:
+        segments.append(f"{rm.done_count}/{rm.total_count} {rm.state.value}")
+
+    active = router.company.active_employee.name if router.company and router.company.active_employee else "CTO"
+    if segments or active != "CTO":
+        segments.append(f"{active}")
+
+    if not segments:
+        return ""
+
+    return f"  {DIM}{f' {ICON_DOT} '.join(segments)}{RESET}"
 
 
 # ---------------------------------------------------------------------------
@@ -633,8 +1135,21 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
 
     ui = CLIOutput(company=router.company)
 
+    # Event-logging wrappers for the control-room feed
+    def _on_deleg_start(name, task, rn, mr):
+        router._log_event("delegate", name, task.split("\n")[0][:50])
+        ui.on_delegation_start(name, task, rn, mr)
+
+    def _on_deleg_end(name, dur, err):
+        router._log_event("fail" if err else "done", name, _format_elapsed(dur))
+        ui.on_delegation_end(name, dur, err)
+
     while True:
         try:
+            strip = _render_status_strip(router)
+            if strip:
+                sys.stdout.write(strip + "\n")
+                sys.stdout.flush()
             prompt = _build_prompt(router)
             line = input(prompt).strip()
 
@@ -648,13 +1163,14 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
 
             # Process the message
             try:
-                ui.start_thinking()
+                speaker_label, speaker_role = _response_identity(router, line)
+                ui.start_thinking(speaker_label=speaker_label, speaker_role=speaker_role)
 
                 response = await router.handle_message(
                     line,
                     on_text=ui.on_text,
-                    on_delegation_start=ui.on_delegation_start,
-                    on_delegation_end=ui.on_delegation_end,
+                    on_delegation_start=_on_deleg_start,
+                    on_delegation_end=_on_deleg_end,
                     on_progress=ui.on_progress,
                 )
 
@@ -674,11 +1190,9 @@ async def run_repl(config: Config, session_name: str = "default") -> None:
                 elif not ui.streamed:
                     print(f"\n  {DIM}(no response){RESET}")
 
-                # Show timing for non-trivial operations
-                elapsed = ui.elapsed
-                if elapsed >= 2.0:
-                    time_str = _format_elapsed(elapsed)
-                    print(f"  {DIM}{time_str}{RESET}")
+                footer = _render_cycle_footer(ui, router)
+                if footer:
+                    print(footer)
                 print()
 
             except KeyboardInterrupt:
@@ -750,13 +1264,23 @@ async def run_oneshot(
     print(f"  {DIM}Repo:{RESET}    {config.repo_root}\n")
 
     ui = CLIOutput(company=router.company)
-    ui.start_thinking()
+
+    def _on_deleg_start(name, task, rn, mr):
+        router._log_event("delegate", name, task.split("\n")[0][:50])
+        ui.on_delegation_start(name, task, rn, mr)
+
+    def _on_deleg_end(name, dur, err):
+        router._log_event("fail" if err else "done", name, _format_elapsed(dur))
+        ui.on_delegation_end(name, dur, err)
+
+    speaker_label, speaker_role = _response_identity(router, message)
+    ui.start_thinking(speaker_label=speaker_label, speaker_role=speaker_role)
 
     response = await router.handle_message(
         message,
         on_text=ui.on_text,
-        on_delegation_start=ui.on_delegation_start,
-        on_delegation_end=ui.on_delegation_end,
+        on_delegation_start=_on_deleg_start,
+        on_delegation_end=_on_deleg_end,
         on_progress=ui.on_progress,
     )
 
@@ -771,10 +1295,9 @@ async def run_oneshot(
     elif not ui.streamed:
         print(f"\n  {DIM}(No response){RESET}")
 
-    elapsed = ui.elapsed
-    if elapsed >= 1.0:
-        time_str = _format_elapsed(elapsed)
-        print(f"  {DIM}{time_str}{RESET}")
+    footer = _render_cycle_footer(ui, router)
+    if footer:
+        print(footer)
     print()
 
     save_state(router.to_dict(), config, session_id=router.session_name)

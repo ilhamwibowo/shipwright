@@ -222,6 +222,66 @@ class TestWorkAssignment:
         assert emp.task_history[0].status == "done"
         assert emp.status == EmployeeStatus.IDLE
 
+
+class TestCTOFallbacks:
+    @pytest.mark.asyncio
+    async def test_cto_chat_casual_failure_falls_back_cleanly(self, config: Config):
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        with patch.object(cto, "run", new=AsyncMock(side_effect=RuntimeError("sdk blew up"))):
+            result = await company.cto_chat("wasap")
+
+        assert result == "I'm here. What do you need built?"
+
+    @pytest.mark.asyncio
+    async def test_cto_chat_thanks_failure_returns_short_reply(self, config: Config):
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        with patch.object(cto, "run", new=AsyncMock(side_effect=RuntimeError("sdk blew up"))):
+            result = await company.cto_chat("thanks")
+
+        assert result == "Any time."
+
+    @pytest.mark.asyncio
+    async def test_cto_chat_repo_failure_returns_snapshot(self, config: Config):
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        with (
+            patch.object(cto, "run", new=AsyncMock(side_effect=RuntimeError("sdk blew up"))),
+            patch(
+                "shipwright.company.company.get_branch_context",
+                return_value=(
+                    "Branch: feature/payments\n"
+                    "Remote: 1 ahead\n"
+                    "Working tree: 2 changed files\n"
+                    "M shipwright/company/company.py\n"
+                    "M tests/test_company.py\n"
+                    "Recent commits:\n"
+                    "  abc123 Add payments telemetry\n"
+                    "  def456 Tighten fallback"
+                ),
+            ),
+        ):
+            result = await company.cto_chat("what changed?")
+
+        assert result.startswith("Repo snapshot:")
+        assert "branch feature/payments" in result
+        assert "Changed files" in result
+
+    @pytest.mark.asyncio
+    async def test_cto_chat_task_failure_returns_operator_message(self, config: Config):
+        company = Company(config=config)
+        cto = company.ensure_cto()
+
+        with patch.object(cto, "run", new=AsyncMock(side_effect=RuntimeError("sdk blew up"))):
+            result = await company.cto_chat("Build a payments API")
+
+        assert "execution error" in result
+        assert "concrete task" in result
+
     @pytest.mark.asyncio
     async def test_assign_to_unknown_raises(self, config: Config):
         company = Company(config=config)

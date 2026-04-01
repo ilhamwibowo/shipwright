@@ -126,6 +126,12 @@ class TestFireConfirmation:
         _, response = router._try_sync_command("fire alex confirm", "fire alex confirm")
         assert "Fired" in response
 
+    def test_fire_logs_event(self, config: Config):
+        router = _make_router_with_employees(config)
+        router._try_sync_command("fire Alex confirm", "fire alex confirm")
+        assert router._events[-1]["kind"] == "fire"
+        assert router._events[-1]["name"] == "Alex"
+
 
 # ---------------------------------------------------------------------------
 # Session clear confirmation
@@ -584,7 +590,7 @@ class TestSDKErrorRecovery:
             router.company, "talk", new_callable=AsyncMock,
             side_effect=RuntimeError("connection failed"),
         ):
-            response = await router.handle_message("What is the API status?")
+            response = await router.handle_message("Can you review the API design?")
 
         assert "Error" in response
         assert alex.status == EmployeeStatus.IDLE
@@ -663,7 +669,7 @@ class TestCTORouting:
 
         mock_result = MemberResult(output="Direct response.", total_cost_usd=0.01)
         with patch.object(alex, "run", new_callable=AsyncMock, return_value=mock_result):
-            response = await router.handle_message("What's the status?")
+            response = await router.handle_message("Review the API structure")
 
         assert "Direct response" in response
 
@@ -699,6 +705,17 @@ class TestIntentClassification:
         assert classify_intent("hola") == Intent.GREETING
         assert classify_intent("howdy") == Intent.GREETING
 
+    def test_slang_greetings_detected(self):
+        assert classify_intent("wasap") == Intent.GREETING
+        assert classify_intent("wassap") == Intent.GREETING
+        assert classify_intent("wasup") == Intent.GREETING
+        assert classify_intent("whaddup") == Intent.GREETING
+
+    def test_status_queries_detected(self):
+        assert classify_intent("what changed in the repo") == Intent.STATUS_QUERY
+        assert classify_intent("what branch are we on") == Intent.STATUS_QUERY
+        assert classify_intent("how's the team") == Intent.STATUS_QUERY
+
     def test_greetings_with_punctuation(self):
         assert classify_intent("hi!") == Intent.GREETING
         assert classify_intent("hello.") == Intent.GREETING
@@ -718,6 +735,11 @@ class TestIntentClassification:
         assert classify_intent("cool") == Intent.GREETING
         assert classify_intent("ok") == Intent.GREETING
         assert classify_intent("got it") == Intent.GREETING
+
+    def test_status_queries_detected(self):
+        assert classify_intent("how's it going") == Intent.STATUS_QUERY
+        assert classify_intent("what changed") == Intent.STATUS_QUERY
+        assert classify_intent("what branch are we on") == Intent.STATUS_QUERY
 
     def test_resume_detected(self):
         assert classify_intent("continue") == Intent.RESUME
@@ -741,6 +763,12 @@ class TestIntentClassification:
         assert classify_intent("cancel") == Intent.STOP
         assert classify_intent("nevermind") == Intent.STOP
         assert classify_intent("scratch that") == Intent.STOP
+
+    def test_status_queries_detected(self):
+        assert classify_intent("what changed?") == Intent.STATUS_QUERY
+        assert classify_intent("what branch are we on?") == Intent.STATUS_QUERY
+        assert classify_intent("repo status") == Intent.STATUS_QUERY
+        assert classify_intent("git status") == Intent.STATUS_QUERY
 
     def test_tasks_not_confused_with_greetings(self):
         """Actual tasks should never be classified as greetings."""
@@ -833,6 +861,31 @@ class TestGreetingBehavior:
             response = await router.handle_message("hello")
         mock_cto.assert_not_called()
 
+
+class TestStatusQueryBehavior:
+    @pytest.mark.asyncio
+    async def test_status_query_never_calls_cto(self, config: Config):
+        router = _make_router(config)
+        router.company.ensure_cto()
+
+        with patch.object(
+            Company, "cto_chat", new_callable=AsyncMock,
+            return_value="Should not be called",
+        ) as mock_cto:
+            response = await router.handle_message("what changed in the repo")
+
+        mock_cto.assert_not_called()
+        assert response
+        assert "Repo:" in response or "Repo state unavailable" in response
+
+    @pytest.mark.asyncio
+    async def test_team_status_query_uses_local_state(self, config: Config):
+        router = _make_router_with_employees(config)
+        response = await router.handle_message("how's the team")
+
+        assert "Crew ready" in response or "Working now" in response
+        assert "Project:" in response
+
     @pytest.mark.asyncio
     async def test_casual_chat_with_paused_task_stays_non_executing(self, config: Config):
         """Casual messages like 'thanks' or 'cool' don't resume paused work."""
@@ -852,6 +905,61 @@ class TestGreetingBehavior:
         for msg in ["thanks", "ok", "cool", "got it"]:
             response = await router.handle_message(msg)
             assert router.company.active_roadmap.state == RoadmapState.PAUSED
+
+
+class TestStatusQueryRouting:
+    @pytest.mark.asyncio
+    async def test_status_query_never_calls_cto(self, config: Config):
+        router = _make_router_with_employees(config)
+        router.company.ensure_cto()
+        router.company.set_active("Alex")
+
+        with patch.object(
+            Company, "cto_chat", new_callable=AsyncMock,
+            return_value="Should not be called",
+        ) as mock_cto:
+            response = await router.handle_message("how's it going")
+
+        mock_cto.assert_not_called()
+        assert "Crew" in response or "Working" in response or "Project" in response
+
+
+class TestStatusQueries:
+    @pytest.mark.asyncio
+    async def test_repo_status_query_does_not_call_cto(self, sample_repo, tmp_path):
+        config = Config(repo_root=sample_repo, sessions_dir=tmp_path / "sessions")
+        router = Router(config=config, session=Session(id="test"))
+
+        with patch.object(
+            Company, "cto_chat", new_callable=AsyncMock, return_value="Should not be called"
+        ) as mock_cto:
+            response = await router.handle_message("what changed?")
+
+        mock_cto.assert_not_called()
+        assert "Repo:" in response
+        assert "branch" in response.lower()
+        assert "Changed files" in response or "working tree clean" in response.lower()
+
+    @pytest.mark.asyncio
+    async def test_generic_status_query_returns_ops_snapshot(self, config: Config):
+        router = _make_router_with_employees(config)
+        response = await router.handle_message("what's the status?")
+
+        assert "Crew" in response or "No engineers" in response or "Team is idle" in response
+        assert "Project:" in response
+        assert "Repo:" not in response
+
+    @pytest.mark.asyncio
+    async def test_repo_query_returns_repo_summary(self, config: Config):
+        router = _make_router(config)
+        response = await router.handle_message("what changed")
+        assert "Repo" in response
+
+    def test_repo_command_alias(self, config: Config):
+        router = _make_router(config)
+        is_cmd, response = router._try_sync_command("repo", "repo")
+        assert is_cmd
+        assert "Repo" in response
 
 
 # ---------------------------------------------------------------------------
@@ -1186,6 +1294,47 @@ class TestWhoCommand:
         assert "Working" in response
         assert "Alex" in response
         assert "Building API" in response
+
+
+class TestEventLog:
+    def test_hire_logs_event(self, config: Config):
+        router = _make_router(config)
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
+        assert router._events[-1]["kind"] == "hire"
+        assert router._events[-1]["detail"] == "Backend Developer"
+
+    @pytest.mark.asyncio
+    async def test_resume_logs_event(self, config: Config):
+        router = _make_router(config)
+        router.company.ensure_cto()
+        router.company.active_roadmap = Roadmap(
+            tasks=[RoadmapTask(index=1, description="Build API")],
+            original_request="Build API",
+            approved=True,
+            paused=True,
+            state=RoadmapState.PAUSED,
+        )
+
+        with patch.object(router.company, "execute_roadmap", new=AsyncMock(return_value="done")):
+            response = await router.handle_message("continue")
+
+        assert response == "done"
+        assert router._events[-1]["kind"] == "resume"
+
+    def test_pause_logs_event(self, config: Config):
+        router = _make_router(config)
+        router.company.ensure_cto()
+        router.company.active_roadmap = Roadmap(
+            tasks=[RoadmapTask(index=1, description="Build API")],
+            original_request="Build API",
+            approved=True,
+            state=RoadmapState.RUNNING,
+        )
+
+        response = router._handle_pause()
+
+        assert "Paused" in response
+        assert router._events[-1]["kind"] == "pause"
 
 
 class TestBoardCommand:

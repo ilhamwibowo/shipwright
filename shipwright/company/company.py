@@ -12,6 +12,7 @@ It manages:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -42,6 +43,7 @@ from shipwright.company.employee import (
 from shipwright.utils.logging import get_logger
 from shipwright.workspace.git import (
     cleanup_worktree,
+    get_branch_context,
     commit,
     create_pr,
     create_worktree,
@@ -55,6 +57,21 @@ logger = get_logger("company.company")
 ROLES_CAN_HIRE: frozenset[str] = frozenset({"cto"})
 ROLES_CAN_DELEGATE: frozenset[str] = frozenset({"cto", "team-lead"})
 ROLES_CAN_REVISE: frozenset[str] = frozenset({"cto", "team-lead"})
+
+_CASUAL_GREETING_PATTERNS: set[str] = {
+    "hi", "hello", "hey", "sup", "yo", "oi", "hola", "hiya", "heya",
+    "morning", "good morning", "afternoon", "good afternoon",
+    "evening", "good evening", "howdy", "whats up", "what's up",
+    "wassup", "wazzup", "wasup", "wassap", "wasap", "whaddup", "waddup",
+    "thanks", "thank you", "cool", "ok", "okay", "got it",
+}
+_CASUAL_GREETING_RE = re.compile(
+    r"^(?:w+a+s+(?:a|u)?p+|w+a+z+u+p+|w+h?a+d+d*u+p+)$"
+)
+_REPO_STATUS_RE = re.compile(
+    r"\b(status|changed|branch|repo|git|diff|commit)\b|what(?:'s|s)? changed|"
+    r"what(?:'s|s)? the status|how(?:'s|s)? the repo|what branch are we on"
+)
 
 
 def format_duration_ms(ms: int) -> str:
@@ -73,6 +90,110 @@ def format_duration_ms(ms: int) -> str:
     if mins:
         return f"{hours}h {mins}m"
     return f"{hours}h"
+
+
+def _looks_casual_message(message: str) -> bool:
+    """Best-effort guardrail for slangy greetings that should not hit the CTO."""
+    lower = re.sub(r"\s+", " ", message.lower().strip())
+    lower = re.sub(r"[!?.,:;]+$", "", lower)
+    squashed = re.sub(r"[^a-z]", "", lower)
+
+    if lower in _CASUAL_GREETING_PATTERNS:
+        return True
+    if _CASUAL_GREETING_RE.fullmatch(squashed):
+        return True
+
+    words = lower.split()
+    if len(words) <= 2 and words:
+        first = re.sub(r"[^a-z]", "", words[0])
+        if first in {
+            "hi", "hello", "hey", "sup", "yo", "oi", "hola",
+            "morning", "afternoon", "evening", "howdy",
+        }:
+            return True
+        if _CASUAL_GREETING_RE.fullmatch(first):
+            return True
+
+    return False
+
+
+def _looks_repo_status_message(message: str) -> bool:
+    """Detect repo/status questions for stronger non-LLM fallback handling."""
+    lower = re.sub(r"\s+", " ", message.lower().strip())
+    lower = re.sub(r"[!?.,:;]+$", "", lower)
+    return bool(_REPO_STATUS_RE.search(lower))
+
+
+def _repo_snapshot_from_context(repo_root: Path) -> str:
+    """Build a concise repo snapshot for fallback responses."""
+    try:
+        context = get_branch_context(repo_root)
+    except Exception:
+        return "Repo state unavailable."
+
+    if not context.strip():
+        return "Repo state unavailable."
+
+    branch = None
+    remote = None
+    working_tree = None
+    changed_files: list[str] = []
+    recent_commits: list[str] = []
+    mode: str | None = None
+
+    for raw_line in context.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("Branch:"):
+            branch = line.partition(":")[2].strip()
+            mode = None
+            continue
+        if line.startswith("Remote:"):
+            remote = line.partition(":")[2].strip()
+            mode = None
+            continue
+        if line.startswith("Working tree:"):
+            working_tree = line.partition(":")[2].strip()
+            mode = "tree" if "clean" not in line.lower() else None
+            continue
+        if line.startswith("Recent commits:"):
+            mode = "commits"
+            continue
+        if mode == "tree":
+            changed_files.append(line)
+            continue
+        if mode == "commits":
+            recent_commits.append(line)
+
+    parts: list[str] = []
+    if branch:
+        parts.append(f"branch {branch}")
+    if remote:
+        parts.append(remote)
+    if working_tree:
+        parts.append(f"working tree {working_tree}")
+    if changed_files:
+        parts.append("Changed files: " + "; ".join(changed_files[:3]))
+    if recent_commits:
+        parts.append("Recent commits: " + "; ".join(recent_commits[:2]))
+
+    if not parts:
+        parts.append(context.splitlines()[0])
+
+    return "Repo snapshot: " + " · ".join(parts) + "."
+
+
+def _casual_fallback_response(message: str) -> str:
+    """Return a human fallback when the CTO SDK fails on casual chat."""
+    lower = re.sub(r"\s+", " ", message.lower().strip())
+    lower = re.sub(r"[!?.,:;]+$", "", lower)
+
+    if any(word in lower for word in ("thanks", "thank you", "thx", "ty")):
+        return "Any time."
+    if any(word in lower for word in ("cool", "okay", "ok", "got it", "understood")):
+        return "Understood. What's next?"
+    return "I'm here. What do you need built?"
 
 
 @dataclass
@@ -118,6 +239,7 @@ class Company:
     branch: str | None = None
     active_roadmap: Roadmap | None = None
     _active_employee: str | None = field(default=None, repr=False)
+    _active_employee_explicit: bool = field(default=False, repr=False)
     _stale_worktree: str | None = field(default=None, repr=False)
 
     max_delegation_rounds: int = 5
@@ -131,6 +253,10 @@ class Company:
     @property
     def is_stale(self) -> bool:
         return self._stale_worktree is not None
+
+    @property
+    def active_employee_is_explicit(self) -> bool:
+        return self._active_employee_explicit
 
     def hire(
         self,
@@ -165,6 +291,7 @@ class Company:
         # Auto-set as active if first employee
         if self._active_employee is None:
             self._active_employee = emp_name
+            self._active_employee_explicit = False
 
         logger.info("Hired %s as %s (%s)", emp_name, role_def.role, role_id)
         return employee
@@ -212,6 +339,7 @@ class Company:
         # Update active employee
         if self._active_employee and self._active_employee not in self.employees:
             self._active_employee = next(iter(self.employees), None)
+            self._active_employee_explicit = False
 
         return fired
 
@@ -275,11 +403,12 @@ class Company:
         employee.team = team_name
         logger.info("Assigned %s to team '%s'", employee_name, team_name)
 
-    def set_active(self, name: str) -> None:
+    def set_active(self, name: str, *, explicit: bool = True) -> None:
         """Set the active employee for conversation."""
         if name not in self.employees:
             raise ValueError(f"No employee named '{name}'.")
         self._active_employee = name
+        self._active_employee_explicit = explicit
 
     # ------------------------------------------------------------------
     # Hierarchy enforcement
@@ -516,12 +645,32 @@ class Company:
             )
 
         # Step 1: CTO responds to the user's message (streamed)
-        result = await cto.run(
-            task=message,
-            system_prompt=system_prompt,
-            on_text=on_text,
-        )
+        try:
+            result = await cto.run(
+                task=message,
+                system_prompt=system_prompt,
+                on_text=on_text,
+            )
+        except Exception as exc:
+            logger.error("CTO execution failed before delegation: %s", exc)
+            if _looks_casual_message(message):
+                return _casual_fallback_response(message)
+            if _looks_repo_status_message(message):
+                return _repo_snapshot_from_context(self.config.repo_root)
+            return (
+                "CTO hit an execution error before delegation. "
+                "Try again, or restate the request as a concrete task."
+            )
         response_text = result.output
+        if not response_text.strip():
+            if _looks_casual_message(message):
+                return _casual_fallback_response(message)
+            if _looks_repo_status_message(message):
+                return _repo_snapshot_from_context(self.config.repo_root)
+            return (
+                "CTO returned no response. "
+                "Try again with a concrete task or a clearer status question."
+            )
 
         # Track CTO conversation
         cto._conversation.append({"role": "user", "text": message})
@@ -1388,6 +1537,7 @@ class Company:
             "employees": {name: emp.to_dict() for name, emp in self.employees.items()},
             "teams": {name: team.to_dict() for name, team in self.teams.items()},
             "active_employee": self._active_employee,
+            "active_employee_explicit": self._active_employee_explicit,
             "worktree_path": wt_str,
             "branch": self.branch,
         }
@@ -1402,6 +1552,7 @@ class Company:
 
         company = cls(config=config)
         company._active_employee = data.get("active_employee")
+        company._active_employee_explicit = data.get("active_employee_explicit", False)
         company.branch = data.get("branch")
 
         wt = data.get("worktree_path")

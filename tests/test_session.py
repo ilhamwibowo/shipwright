@@ -114,6 +114,35 @@ class TestRoundTrip:
         restored = Router.from_dict(data, config)
         assert restored.session_name == "myproject"
 
+    def test_round_trip_preserves_explicit_active_employee(self, config: Config):
+        """Explicit conversation targeting survives save/load."""
+        session = Session(id="explicit")
+        router = Router(config=config, session=session, session_name="explicit")
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
+        router.company.ensure_cto()
+        router.company.set_active("CTO")
+
+        save_state(router.to_dict(), config, session_id="explicit")
+        data = load_state(config, session_id="explicit")
+        restored = Router.from_dict(data, config)
+
+        assert restored.company.active_employee is not None
+        assert restored.company.active_employee.name == "CTO"
+        assert restored.company.active_employee_is_explicit is True
+
+    def test_round_trip_preserves_events(self, config: Config):
+        """Control-room events survive save/load."""
+        session = Session(id="events")
+        router = Router(config=config, session=session, session_name="events")
+        router._try_sync_command("hire backend-dev", "hire backend-dev")
+
+        save_state(router.to_dict(), config, session_id="events")
+        data = load_state(config, session_id="events")
+        restored = Router.from_dict(data, config)
+
+        assert restored._events
+        assert restored._events[-1]["kind"] == "hire"
+
 
 # ---------------------------------------------------------------------------
 # Named sessions
@@ -226,6 +255,7 @@ class TestSessionCommands:
         # Create and save a session
         router1 = self._make_router(config)
         router1._try_sync_command("hire backend-dev", "hire backend-dev")
+        router1._events = [{"ts": 123.0, "kind": "hire", "name": "Alex", "detail": "Backend Developer"}]
         save_state(router1.to_dict(), config, session_id="saved-session")
 
         # Start a fresh router
@@ -241,6 +271,7 @@ class TestSessionCommands:
         assert "1 employee(s)" in response
         assert len(router2.company.employees) == 1
         assert router2.session_name == "saved-session"
+        assert router2._events[-1]["kind"] == "hire"
 
     def test_session_load_nonexistent(self, config: Config):
         router = self._make_router(config)
