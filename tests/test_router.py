@@ -6,9 +6,17 @@ import pytest
 
 from shipwright.config import Config
 from shipwright.company.company import Company
-from shipwright.company.employee import EmployeeStatus, MemberResult, Task
+from shipwright.company.employee import (
+    EmployeeStatus,
+    MemberResult,
+    Roadmap,
+    RoadmapState,
+    RoadmapTask,
+    RoadmapTaskStatus,
+    Task,
+)
 from shipwright.company.roles import get_role_def
-from shipwright.conversation.router import Router
+from shipwright.conversation.router import Intent, Router, classify_intent
 from shipwright.conversation.session import Session
 
 
@@ -417,7 +425,7 @@ class TestEmptyCompanyEdgeCases:
 
     def test_team_overview_empty(self, config: Config):
         router = _make_router(config)
-        _, response = router._try_sync_command("team", "team")
+        _, response = router._try_sync_command("org", "org")
         assert "No employees" in response
 
     @pytest.mark.asyncio
@@ -428,13 +436,13 @@ class TestEmptyCompanyEdgeCases:
 
     @pytest.mark.asyncio
     async def test_message_routes_to_cto(self, config: Config):
-        """Free-form messages auto-create CTO and route through CTO flow."""
+        """Free-form task messages auto-create CTO and route through CTO flow."""
         router = _make_router(config)
         with patch.object(
             Company, "cto_chat", new_callable=AsyncMock,
             return_value="I'll handle this.",
         ):
-            response = await router.handle_message("hello there")
+            response = await router.handle_message("build a payment system")
         assert "CTO" in router.company.employees
         assert "I'll handle this." in response
 
@@ -513,7 +521,8 @@ class TestAlwaysAvailableCommands:
     def test_help(self, config: Config):
         router = _make_router(config)
         _, response = router._try_sync_command("help", "help")
-        assert "Shipwright Commands" in response
+        assert "Shipwright" in response
+        assert "hire" in response
 
     def test_roles(self, config: Config):
         router = _make_router(config)
@@ -575,7 +584,7 @@ class TestSDKErrorRecovery:
             router.company, "talk", new_callable=AsyncMock,
             side_effect=RuntimeError("connection failed"),
         ):
-            response = await router.handle_message("Hello Alex")
+            response = await router.handle_message("What is the API status?")
 
         assert "Error" in response
         assert alex.status == EmployeeStatus.IDLE
@@ -668,3 +677,578 @@ class TestCTORouting:
         ):
             response = await router.handle_message("Build something")
         assert "Error" in response
+
+
+# ---------------------------------------------------------------------------
+# Intent Classification
+# ---------------------------------------------------------------------------
+
+
+class TestIntentClassification:
+    """Tests for the classify_intent function."""
+
+    def test_greetings_detected(self):
+        assert classify_intent("hi") == Intent.GREETING
+        assert classify_intent("hello") == Intent.GREETING
+        assert classify_intent("hey") == Intent.GREETING
+        assert classify_intent("sup") == Intent.GREETING
+        assert classify_intent("yo") == Intent.GREETING
+        assert classify_intent("oi") == Intent.GREETING
+        assert classify_intent("morning") == Intent.GREETING
+        assert classify_intent("good morning") == Intent.GREETING
+        assert classify_intent("hola") == Intent.GREETING
+        assert classify_intent("howdy") == Intent.GREETING
+
+    def test_greetings_with_punctuation(self):
+        assert classify_intent("hi!") == Intent.GREETING
+        assert classify_intent("hello.") == Intent.GREETING
+        assert classify_intent("hey?") == Intent.GREETING
+        assert classify_intent("morning!") == Intent.GREETING
+
+    def test_greetings_with_extra_words(self):
+        """Short greeting + 1-2 extra words still classified as greeting."""
+        assert classify_intent("hi there") == Intent.GREETING
+        assert classify_intent("hello team") == Intent.GREETING
+        assert classify_intent("hey cto") == Intent.GREETING
+        assert classify_intent("morning all") == Intent.GREETING
+
+    def test_smalltalk_detected(self):
+        assert classify_intent("how are you") == Intent.GREETING
+        assert classify_intent("thanks") == Intent.GREETING
+        assert classify_intent("cool") == Intent.GREETING
+        assert classify_intent("ok") == Intent.GREETING
+        assert classify_intent("got it") == Intent.GREETING
+
+    def test_resume_detected(self):
+        assert classify_intent("continue") == Intent.RESUME
+        assert classify_intent("resume") == Intent.RESUME
+        assert classify_intent("go on") == Intent.RESUME
+        assert classify_intent("keep going") == Intent.RESUME
+        assert classify_intent("carry on") == Intent.RESUME
+
+    def test_pause_detected(self):
+        assert classify_intent("pause") == Intent.PAUSE
+        assert classify_intent("hold") == Intent.PAUSE
+        assert classify_intent("hold on") == Intent.PAUSE
+
+    def test_pause_now_detected(self):
+        assert classify_intent("pause now") == Intent.PAUSE_NOW
+        assert classify_intent("halt") == Intent.PAUSE_NOW
+        assert classify_intent("stop now") == Intent.PAUSE_NOW
+
+    def test_stop_detected(self):
+        assert classify_intent("stop") == Intent.STOP
+        assert classify_intent("cancel") == Intent.STOP
+        assert classify_intent("nevermind") == Intent.STOP
+        assert classify_intent("scratch that") == Intent.STOP
+
+    def test_tasks_not_confused_with_greetings(self):
+        """Actual tasks should never be classified as greetings."""
+        assert classify_intent("build a payment system") == Intent.TASK
+        assert classify_intent("add user authentication") == Intent.TASK
+        assert classify_intent("fix the bug in the login form") == Intent.TASK
+        assert classify_intent("hello world endpoint") == Intent.TASK  # 3+ words with context
+
+    def test_case_insensitive(self):
+        assert classify_intent("HI") == Intent.GREETING
+        assert classify_intent("Hello") == Intent.GREETING
+        assert classify_intent("PAUSE") == Intent.PAUSE
+        assert classify_intent("CONTINUE") == Intent.RESUME
+        assert classify_intent("STOP") == Intent.STOP
+
+
+# ---------------------------------------------------------------------------
+# Greeting Behavior — greetings must NEVER execute work
+# ---------------------------------------------------------------------------
+
+
+class TestGreetingBehavior:
+    @pytest.mark.asyncio
+    async def test_greeting_does_not_resume_work(self, config: Config):
+        """Greeting with a paused roadmap must NOT resume execution."""
+        router = _make_router(config)
+        router.company.ensure_cto()
+        # Create a paused roadmap
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.DONE),
+                RoadmapTask(index=2, description="Add tests", status=RoadmapTaskStatus.PENDING),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            paused=True,
+            state=RoadmapState.PAUSED,
+        )
+        router.company.active_roadmap = roadmap
+
+        response = await router.handle_message("hi")
+
+        # Should mention paused work but NOT resume it
+        assert "paused" in response.lower()
+        assert "continue" in response.lower()
+        # Roadmap should still be paused
+        assert router.company.active_roadmap.state == RoadmapState.PAUSED
+        assert router.company.active_roadmap.paused is True
+
+    @pytest.mark.asyncio
+    async def test_greeting_no_team(self, config: Config):
+        """Greeting with no team gives contextual response."""
+        router = _make_router(config)
+        response = await router.handle_message("morning")
+        # Should get a non-empty response that doesn't trigger work
+        assert len(response) > 5
+        assert "CTO" not in router.company.employees or router.company.employees.get("CTO") is None
+
+    @pytest.mark.asyncio
+    async def test_greeting_with_idle_team(self, config: Config):
+        """Greeting with idle team mentions team is ready."""
+        router = _make_router_with_employees(config)
+        response = await router.handle_message("sup")
+        # Should mention team state or ask what to do
+        assert len(response) > 5
+        lower = response.lower()
+        assert any(w in lower for w in ("idle", "what", "next", "need", "here"))
+
+    @pytest.mark.asyncio
+    async def test_greeting_with_working_team(self, config: Config):
+        """Greeting while team is working mentions who is working."""
+        router = _make_router_with_employees(config)
+        alex = router.company.employees["Alex"]
+        alex.status = EmployeeStatus.WORKING
+        response = await router.handle_message("hey")
+        assert "Alex" in response
+        # Should mention working state in some form
+        lower = response.lower()
+        assert any(w in lower for w in ("working", "on it", "busy"))
+
+    @pytest.mark.asyncio
+    async def test_greeting_never_calls_cto(self, config: Config):
+        """Greetings should never route to CTO chat."""
+        router = _make_router(config)
+        router.company.ensure_cto()
+        with patch.object(
+            Company, "cto_chat", new_callable=AsyncMock,
+            return_value="Should not be called",
+        ) as mock_cto:
+            response = await router.handle_message("hello")
+        mock_cto.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_casual_chat_with_paused_task_stays_non_executing(self, config: Config):
+        """Casual messages like 'thanks' or 'cool' don't resume paused work."""
+        router = _make_router(config)
+        router.company.ensure_cto()
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Setup DB", status=RoadmapTaskStatus.PENDING),
+            ],
+            original_request="Build database layer",
+            approved=True,
+            paused=True,
+            state=RoadmapState.PAUSED,
+        )
+        router.company.active_roadmap = roadmap
+
+        for msg in ["thanks", "ok", "cool", "got it"]:
+            response = await router.handle_message(msg)
+            assert router.company.active_roadmap.state == RoadmapState.PAUSED
+
+
+# ---------------------------------------------------------------------------
+# Pause / Stop / Resume Controls
+# ---------------------------------------------------------------------------
+
+
+class TestPauseStopResume:
+    @pytest.mark.asyncio
+    async def test_pause_marks_roadmap_paused(self, config: Config):
+        """'pause' command sets roadmap to PAUSED state."""
+        router = _make_router(config)
+        router.company.ensure_cto()
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.RUNNING),
+                RoadmapTask(index=2, description="Add tests", status=RoadmapTaskStatus.PENDING),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            paused=False,
+            state=RoadmapState.RUNNING,
+        )
+        router.company.active_roadmap = roadmap
+
+        response = await router.handle_message("pause")
+
+        assert "Paused" in response
+        assert router.company.active_roadmap.state == RoadmapState.PAUSED
+        # Running task should be reset to pending
+        assert roadmap.tasks[0].status == RoadmapTaskStatus.PENDING
+
+    @pytest.mark.asyncio
+    async def test_pause_now_marks_interrupted(self, config: Config):
+        """'pause now' sets roadmap to INTERRUPTED state."""
+        router = _make_router(config)
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.RUNNING),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            state=RoadmapState.RUNNING,
+        )
+        router.company.active_roadmap = roadmap
+
+        response = await router.handle_message("pause now")
+
+        assert "Interrupted" in response
+        assert router.company.active_roadmap.state == RoadmapState.INTERRUPTED
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_roadmap(self, config: Config):
+        """'stop' cancels the roadmap and sets STOPPED state."""
+        router = _make_router(config)
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.DONE),
+                RoadmapTask(index=2, description="Add tests", status=RoadmapTaskStatus.RUNNING),
+                RoadmapTask(index=3, description="Deploy", status=RoadmapTaskStatus.PENDING),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            state=RoadmapState.RUNNING,
+        )
+        router.company.active_roadmap = roadmap
+
+        response = await router.handle_message("stop")
+
+        assert "Stopped" in response
+        assert "1/3" in response  # 1 task was done
+        assert router.company.active_roadmap.state == RoadmapState.STOPPED
+
+    @pytest.mark.asyncio
+    async def test_continue_resumes_paused_roadmap(self, config: Config):
+        """'continue' resumes a paused roadmap."""
+        router = _make_router(config)
+        router.company.ensure_cto()
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.DONE),
+                RoadmapTask(index=2, description="Add tests", status=RoadmapTaskStatus.PENDING),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            paused=True,
+            state=RoadmapState.PAUSED,
+        )
+        router.company.active_roadmap = roadmap
+
+        with patch.object(
+            Company, "execute_roadmap", new_callable=AsyncMock,
+            return_value="Roadmap execution complete.",
+        ) as mock_exec:
+            response = await router.handle_message("continue")
+
+        mock_exec.assert_called_once()
+        assert router.company.active_roadmap.state == RoadmapState.RUNNING
+
+    @pytest.mark.asyncio
+    async def test_resume_after_stop_rejected(self, config: Config):
+        """Cannot resume a stopped roadmap."""
+        router = _make_router(config)
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.PENDING),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            paused=True,
+            state=RoadmapState.STOPPED,
+        )
+        router.company.active_roadmap = roadmap
+
+        response = await router.handle_message("continue")
+
+        assert "stopped" in response.lower()
+        assert router.company.active_roadmap.state == RoadmapState.STOPPED
+
+    @pytest.mark.asyncio
+    async def test_pause_without_roadmap(self, config: Config):
+        """Pausing with no active roadmap gives a clear message."""
+        router = _make_router(config)
+        response = await router.handle_message("pause")
+        assert "nothing to pause" in response.lower() or "no active roadmap" in response.lower()
+
+    @pytest.mark.asyncio
+    async def test_stop_without_roadmap(self, config: Config):
+        """Stopping with no active roadmap gives a clear message."""
+        router = _make_router(config)
+        response = await router.handle_message("stop")
+        assert "nothing to stop" in response.lower() or "no active roadmap" in response.lower()
+
+    @pytest.mark.asyncio
+    async def test_resume_without_roadmap(self, config: Config):
+        """Resuming with no roadmap gives a clear message."""
+        router = _make_router(config)
+        response = await router.handle_message("resume")
+        assert "nothing to resume" in response.lower() or "no active roadmap" in response.lower()
+
+
+# ---------------------------------------------------------------------------
+# Status display with paused/interrupted roadmap
+# ---------------------------------------------------------------------------
+
+
+class TestStatusWithPausedRoadmap:
+    def test_status_shows_paused_roadmap(self, config: Config):
+        """Status summary includes paused roadmap info."""
+        router = _make_router_with_employees(config)
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.DONE),
+                RoadmapTask(index=2, description="Add tests", status=RoadmapTaskStatus.PENDING),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            paused=True,
+            state=RoadmapState.PAUSED,
+        )
+        router.company.active_roadmap = roadmap
+
+        summary = router.company.status_summary
+        assert "Paused" in summary or "PAUSED" in summary
+        assert "1/2" in summary
+
+    def test_status_shows_interrupted_roadmap(self, config: Config):
+        """Status summary shows interrupted state distinctly from paused."""
+        router = _make_router_with_employees(config)
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.PENDING),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            paused=True,
+            state=RoadmapState.INTERRUPTED,
+        )
+        router.company.active_roadmap = roadmap
+
+        summary = router.company.status_summary
+        assert "Interrupted" in summary or "INTERRUPTED" in summary
+
+    def test_roadmap_display_shows_paused_marker(self, config: Config):
+        """Roadmap status display marks which task was paused at."""
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.DONE),
+                RoadmapTask(index=2, description="Add tests", status=RoadmapTaskStatus.PENDING),
+                RoadmapTask(index=3, description="Deploy", status=RoadmapTaskStatus.PENDING),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            paused=True,
+            state=RoadmapState.PAUSED,
+        )
+
+        display = roadmap.status_display()
+        assert "paused here" in display
+        assert "PAUSED" in display
+
+    def test_roadmap_display_shows_interrupted_marker(self, config: Config):
+        """Roadmap display shows interrupted marker."""
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.PENDING),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            paused=True,
+            state=RoadmapState.INTERRUPTED,
+        )
+
+        display = roadmap.status_display()
+        assert "interrupted here" in display
+        assert "INTERRUPTED" in display
+
+    def test_roadmap_display_stopped(self, config: Config):
+        """Roadmap display shows stopped state."""
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.DONE),
+                RoadmapTask(index=2, description="Add tests", status=RoadmapTaskStatus.FAILED,
+                            output_summary="Cancelled by user"),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            paused=True,
+            state=RoadmapState.STOPPED,
+        )
+
+        display = roadmap.status_display()
+        assert "STOPPED" in display
+        assert "cancelled" in display.lower()
+
+
+# ---------------------------------------------------------------------------
+# Roadmap state serialization round-trip
+# ---------------------------------------------------------------------------
+
+
+class TestRoadmapStateSerialization:
+    def test_roadmap_state_round_trip(self):
+        """Roadmap state survives serialization."""
+        roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Build API", status=RoadmapTaskStatus.DONE),
+                RoadmapTask(index=2, description="Add tests", status=RoadmapTaskStatus.PENDING),
+            ],
+            original_request="Build the backend",
+            approved=True,
+            paused=True,
+            state=RoadmapState.PAUSED,
+        )
+
+        data = roadmap.to_dict()
+        restored = Roadmap.from_dict(data)
+        assert restored.state == RoadmapState.PAUSED
+        assert restored.paused is True
+        assert restored.approved is True
+
+    def test_backward_compat_no_state_field(self):
+        """Old roadmap data without 'state' field derives state from 'paused'."""
+        data = {
+            "tasks": [{"index": 1, "description": "Task 1", "status": "pending"}],
+            "original_request": "Do work",
+            "approved": True,
+            "paused": True,
+        }
+        roadmap = Roadmap.from_dict(data)
+        assert roadmap.state == RoadmapState.PAUSED
+
+    def test_backward_compat_running(self):
+        """Old roadmap data approved+not_paused -> RUNNING."""
+        data = {
+            "tasks": [{"index": 1, "description": "Task 1", "status": "pending"}],
+            "original_request": "Do work",
+            "approved": True,
+            "paused": False,
+        }
+        roadmap = Roadmap.from_dict(data)
+        assert roadmap.state == RoadmapState.RUNNING
+
+
+# ---------------------------------------------------------------------------
+# New commands: org, who, board
+# ---------------------------------------------------------------------------
+
+
+class TestOrgCommand:
+    def test_org_empty(self, config: Config):
+        router = _make_router(config)
+        _, response = router._try_sync_command("org", "org")
+        assert "No employees" in response
+
+    def test_org_with_employees(self, config: Config):
+        router = _make_router_with_employees(config)
+        _, response = router._try_sync_command("org", "org")
+        assert "Alex" in response
+        assert "Blake" in response
+        assert "Org Chart" in response
+
+    def test_org_aliases(self, config: Config):
+        """org, team, teams, company all work."""
+        router = _make_router(config)
+        for cmd in ("org", "team", "teams", "company"):
+            is_cmd, _ = router._try_sync_command(cmd, cmd)
+            assert is_cmd, f"'{cmd}' not recognized"
+
+
+class TestWhoCommand:
+    def test_who_empty(self, config: Config):
+        router = _make_router(config)
+        _, response = router._try_sync_command("who", "who")
+        assert "No employees" in response
+
+    def test_who_all_idle(self, config: Config):
+        router = _make_router_with_employees(config)
+        _, response = router._try_sync_command("who", "who")
+        assert "Alex" in response
+        assert "Blake" in response
+        assert "idle" in response.lower()
+
+    def test_who_with_working(self, config: Config):
+        router = _make_router_with_employees(config)
+        alex = router.company.employees["Alex"]
+        alex.status = EmployeeStatus.WORKING
+        alex.current_task = Task(
+            id="t1", description="Building API", assigned_to="Alex", status="running"
+        )
+        _, response = router._try_sync_command("who", "who")
+        assert "Working" in response
+        assert "Alex" in response
+        assert "Building API" in response
+
+
+class TestBoardCommand:
+    def test_board_no_roadmap(self, config: Config):
+        router = _make_router(config)
+        _, response = router._try_sync_command("board", "board")
+        assert "No active roadmap" in response
+
+    def test_board_with_roadmap(self, config: Config):
+        router = _make_router(config)
+        router.company.ensure_cto()
+        router.company.active_roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Task A", status=RoadmapTaskStatus.DONE),
+                RoadmapTask(index=2, description="Task B"),
+            ],
+            original_request="Build it",
+        )
+        _, response = router._try_sync_command("board", "board")
+        assert "Task A" in response
+        assert "go" in response.lower()
+
+
+class TestStatusCommand:
+    def test_status_empty(self, config: Config):
+        router = _make_router(config)
+        _, response = router._try_sync_command("status", "status")
+        assert "No employees" in response
+
+    def test_status_with_employees(self, config: Config):
+        router = _make_router_with_employees(config)
+        _, response = router._try_sync_command("status", "status")
+        assert "Status" in response
+        assert "idle" in response
+
+    def test_status_with_roadmap(self, config: Config):
+        router = _make_router_with_employees(config)
+        router.company.active_roadmap = Roadmap(
+            tasks=[
+                RoadmapTask(index=1, description="Task A", status=RoadmapTaskStatus.DONE),
+                RoadmapTask(index=2, description="Task B"),
+            ],
+            original_request="Build it",
+            approved=True,
+            state=RoadmapState.RUNNING,
+        )
+        _, response = router._try_sync_command("status", "status")
+        assert "Roadmap" in response
+        assert "1/2" in response
+
+
+class TestTalkBackUX:
+    def test_talk_shows_context(self, config: Config):
+        router = _make_router_with_employees(config)
+        _, response = router._try_sync_command("talk Alex", "talk alex")
+        assert "Switched to" in response
+        assert "Alex" in response
+        assert "back" in response.lower()
+
+    def test_back_shows_previous(self, config: Config):
+        router = _make_router_with_employees(config)
+        router.company.ensure_cto()
+        router.company.set_active("Alex")
+        _, response = router._try_sync_command("back", "back")
+        assert "CTO" in response
+        assert "Alex" in response

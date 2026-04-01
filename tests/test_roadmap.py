@@ -203,8 +203,10 @@ class TestRoadmap:
         assert "1/3" in display
 
     def test_status_display_paused(self):
+        from shipwright.company.employee import RoadmapState
         rm = self._make_roadmap()
         rm.paused = True
+        rm.state = RoadmapState.PAUSED
 
         display = rm.status_display()
         assert "Paused" in display
@@ -680,6 +682,7 @@ class TestRouterRoadmap:
         router = self._make_router(config)
         cto = router.company.ensure_cto()
 
+        from shipwright.company.employee import RoadmapState
         router.company.active_roadmap = Roadmap(
             tasks=[
                 RoadmapTask(index=1, description="Task A", status=RoadmapTaskStatus.FAILED),
@@ -687,6 +690,7 @@ class TestRouterRoadmap:
             original_request="Build it",
             approved=True,
             paused=True,
+            state=RoadmapState.PAUSED,
         )
 
         mock_result = MemberResult(output="Fixed.", session_id="s", num_turns=1)

@@ -12,7 +12,7 @@ from typing import Callable
 from shipwright.config import Config
 from shipwright.conversation.session import Session
 from shipwright.company.company import Company
-from shipwright.company.employee import EmployeeStatus
+from shipwright.company.employee import EmployeeStatus, RoadmapState
 from shipwright.company.roles import (
     BUILTIN_ROLES,
     ROLE_DISPLAY_NAMES,
@@ -33,6 +33,104 @@ from shipwright.utils.logging import get_logger
 from shipwright.workspace.project import ProjectInfo, discover_project
 
 logger = get_logger("conversation.router")
+
+
+# ---------------------------------------------------------------------------
+# Intent classification — gate before CTO execution
+# ---------------------------------------------------------------------------
+
+class Intent:
+    """Classified intent of a user message."""
+    GREETING = "greeting"
+    STATUS_QUERY = "status_query"
+    RESUME = "resume"
+    PAUSE = "pause"
+    PAUSE_NOW = "pause_now"
+    STOP = "stop"
+    COMMAND = "command"
+    TASK = "task"
+
+
+# Greeting patterns — casual greetings that should NEVER trigger work
+_GREETING_PATTERNS: set[str] = {
+    "hi", "hello", "hey", "sup", "yo", "oi", "hola",
+    "morning", "good morning", "gm",
+    "afternoon", "good afternoon",
+    "evening", "good evening",
+    "howdy", "whats up", "what's up", "wassup", "wazzup",
+    "hiya", "heya", "heyy", "heyyy",
+    "greetings", "salutations",
+    "hi there", "hello there", "hey there",
+    "good day", "g'day",
+}
+
+# Small-talk patterns that are NOT work requests
+_SMALLTALK_PATTERNS: set[str] = {
+    "how are you", "how's it going", "how are things",
+    "what's good", "how do you do",
+    "long time no see", "nice to see you",
+    "thanks", "thank you", "ty", "thx",
+    "cool", "nice", "great", "awesome", "ok", "okay", "k",
+    "got it", "understood", "noted",
+}
+
+_RESUME_PATTERNS: set[str] = {
+    "continue", "resume", "go on", "keep going",
+    "pick up where we left off", "carry on",
+    "proceed", "let's continue", "let's resume",
+    "continue roadmap", "resume roadmap",
+}
+
+_PAUSE_PATTERNS: set[str] = {
+    "pause", "hold", "hold on", "wait",
+    "pause roadmap", "hold roadmap",
+}
+
+_PAUSE_NOW_PATTERNS: set[str] = {
+    "pause now", "stop now", "halt", "halt now",
+    "abort", "pause immediately", "stop immediately",
+}
+
+_STOP_PATTERNS: set[str] = {
+    "stop", "cancel", "cancel roadmap", "stop roadmap",
+    "drop it", "nevermind", "never mind", "nvm",
+    "scrap it", "kill it", "scratch that",
+}
+
+
+def classify_intent(text: str) -> str:
+    """Classify user intent from message text.
+
+    Returns one of the Intent constants. This runs BEFORE any command parsing
+    or CTO routing, so it catches greetings and execution controls early.
+    """
+    lower = text.lower().strip().rstrip("!?.,:;")
+
+    # Exact match first (highest confidence)
+    if lower in _PAUSE_NOW_PATTERNS:
+        return Intent.PAUSE_NOW
+    if lower in _PAUSE_PATTERNS:
+        return Intent.PAUSE
+    if lower in _STOP_PATTERNS:
+        return Intent.STOP
+    if lower in _RESUME_PATTERNS:
+        return Intent.RESUME
+    if lower in _GREETING_PATTERNS:
+        return Intent.GREETING
+    if lower in _SMALLTALK_PATTERNS:
+        return Intent.GREETING  # treat small talk same as greeting
+
+    # Fuzzy greeting detection: short messages that look casual
+    # Only 1-2 words where the first word is a greeting — "hi team", "hey cto"
+    # 3+ words starting with a greeting word are likely real requests ("hello world endpoint")
+    words = lower.split()
+    if len(words) <= 2:
+        if words[0] in {"hi", "hello", "hey", "sup", "yo", "oi", "morning",
+                         "afternoon", "evening", "howdy", "hiya", "heya",
+                         "greetings", "hola", "gm"}:
+            return Intent.GREETING
+
+    return Intent.TASK
 
 
 @dataclass
@@ -73,10 +171,11 @@ class Router:
         """Process a user message and return the response.
 
         The dispatch order is:
-        0. Direct employee access: @name message
-        1. Async commands that need ``await`` (assign work, ship)
-        2. Synchronous commands (hire, fire, status, ...)
-        3. Conversational fallback — route to CTO or active employee
+        0. Intent classification — catch greetings, pause/stop/resume early
+        1. Direct employee access: @name message
+        2. Async commands that need ``await`` (assign work, ship)
+        3. Synchronous commands (hire, fire, status, ...)
+        4. Conversational fallback — route to CTO or active employee
         """
         text = text.strip()
         if not text:
@@ -95,7 +194,40 @@ class Router:
 
         lower = text.lower().strip()
 
-        # ---- 0. Direct employee access: @name message ----------------------
+        # ---- 0. Intent classification — gate before CTO --------------------
+        intent = classify_intent(text)
+
+        if intent == Intent.GREETING:
+            response = self._handle_greeting(text)
+            self.session.add_system_message(response)
+            return response
+
+        if intent == Intent.PAUSE:
+            response = self._handle_pause()
+            self.session.add_system_message(response)
+            return response
+
+        if intent == Intent.PAUSE_NOW:
+            response = self._handle_pause_now()
+            self.session.add_system_message(response)
+            return response
+
+        if intent == Intent.STOP:
+            response = self._handle_stop()
+            self.session.add_system_message(response)
+            return response
+
+        if intent == Intent.RESUME:
+            response = await self._handle_resume(
+                on_text=on_text,
+                on_delegation_start=on_delegation_start,
+                on_delegation_end=on_delegation_end,
+                on_progress=on_progress,
+            )
+            self.session.add_system_message(response)
+            return response
+
+        # ---- 1. Direct employee access: @name message ----------------------
         at_match = re.match(r'^@(\w+)\s+(.+)$', text, re.DOTALL)
         if at_match:
             name = at_match.group(1)
@@ -121,7 +253,7 @@ class Router:
                 self.session.add_system_message(response)
                 return response
 
-        # ---- 1. Async: assign work -----------------------------------------
+        # ---- 2. Async: assign work -----------------------------------------
         # "assign <target> to <team>" — team membership (sync, handled below)
         # "assign <target> "<task>"" or "assign <target> <task>" — work (async)
 
@@ -195,7 +327,7 @@ class Router:
                 self.session.add_system_message(response)
                 return response
 
-        # ---- 2a. Async: roadmap approval / resume ----------------------------
+        # ---- 2a. Async: roadmap approval ------------------------------------
         if lower in ("go", "approve", "ship it", "lgtm"):
             response = await self._roadmap_approve(
                 on_text=on_text,
@@ -207,18 +339,6 @@ class Router:
                 self.session.add_system_message(response)
                 return response
             # No roadmap to approve — fall through to conversational
-
-        if lower in ("continue", "resume"):
-            response = await self._roadmap_resume(
-                on_text=on_text,
-                on_delegation_start=on_delegation_start,
-                on_delegation_end=on_delegation_end,
-                on_progress=on_progress,
-            )
-            if response:
-                self.session.add_system_message(response)
-                return response
-            # No roadmap to resume — fall through to conversational
 
         # ---- 2b. Async: ship / pr ------------------------------------------
         if lower.startswith("ship") or lower in ("pr", "open pr", "create pr"):
@@ -288,8 +408,8 @@ class Router:
     def _try_sync_command(self, text: str, lower: str) -> tuple[bool, str]:
         """Try synchronous commands. Returns (is_command, response)."""
 
-        # roadmap — show current roadmap status
-        if lower in ("roadmap", "roadmap status", "plan"):
+        # roadmap / board — show current roadmap status
+        if lower in ("roadmap", "roadmap status", "plan", "board"):
             return True, self._roadmap_status()
 
         # back — return to CTO
@@ -315,14 +435,17 @@ class Router:
         fire_match = re.match(r'^(?:fire|dismiss)\s+(.+)$', lower)
         if fire_match:
             raw_target = fire_match.group(1).strip()
-            # Check for confirmation suffix
             confirmed = raw_target.endswith(" confirm")
             target = raw_target.removesuffix(" confirm").strip() if confirmed else raw_target
             return True, self._fire(target, confirmed=confirmed)
 
-        # team overview
-        if lower in ("team", "teams", "company", "org"):
-            return True, self._team_overview()
+        # org / team / company — org chart view
+        if lower in ("org", "team", "teams", "company"):
+            return True, self._org_view()
+
+        # who — quick view of who is doing what
+        if lower in ("who", "who is working", "workers"):
+            return True, self._who()
 
         # team create <name>
         team_create_match = re.match(r'^team\s+create\s+(.+)$', lower)
@@ -345,8 +468,8 @@ class Router:
         if talk_match:
             return True, self._talk(talk_match.group(1))
 
-        # status
-        if lower in ("status", "overview", "board"):
+        # status — company overview
+        if lower in ("status", "overview"):
             return True, self._status()
 
         # costs
@@ -508,26 +631,45 @@ class Router:
             except ValueError as e:
                 return str(e)
 
-    def _team_overview(self) -> str:
-        """Show company overview."""
+    def _org_view(self) -> str:
+        """Show org chart — structured view of teams and employees."""
         n = len(self.company.employees)
-        nt = len(self.company.teams)
 
         if n == 0:
             return (
-                "No employees yet. Hire some!\n"
-                "Type `roles` to see available roles, or `hire <role>` to get started."
+                "No employees yet.\n"
+                "Type `hire <role>` to get started, or just tell the CTO what to build."
             )
 
-        team_label = f", {nt} team(s)" if nt else ""
-        lines = [f"**Your Company** ({n} employees{team_label})\n"]
+        lines = [f"**Org Chart** ({n} total)\n"]
         lines.append(self.company.status_summary)
+        return "\n".join(lines)
 
-        if not self.company.teams:
-            lines.append(
-                "\n  No teams configured. Employees work independently.\n"
-                "  Use `team create <name>` to organize them."
-            )
+    def _who(self) -> str:
+        """Quick view: who is doing what right now."""
+        employees = [
+            e for e in self.company.employees.values() if e.role != "cto"
+        ]
+        if not employees:
+            return "No employees hired yet."
+
+        lines: list[str] = []
+        working = [e for e in employees if e.status == EmployeeStatus.WORKING]
+        idle = [e for e in employees if e.status == EmployeeStatus.IDLE]
+
+        if working:
+            lines.append("**Working**")
+            for e in working:
+                task = e.current_task.description[:50] if e.current_task else "..."
+                lines.append(f"  {e.name} ({e.display_role}) \u2014 {task}")
+        if idle:
+            lines.append("**Idle**" if working else "**All idle**")
+            for e in idle:
+                last = ""
+                if e.task_history:
+                    lt = e.task_history[-1]
+                    last = f" \u2014 last: {lt.description[:35]}"
+                lines.append(f"  {e.name} ({e.display_role}){last}")
 
         return "\n".join(lines)
 
@@ -577,21 +719,62 @@ class Router:
             return f"No employee named '{name}'."
         self.company.set_active(resolved)
         emp = self.company.employees[resolved]
-        return f"Now talking to **{resolved}** ({emp.display_role})."
+        status = ""
+        if emp.status == EmployeeStatus.WORKING and emp.current_task:
+            status = f" \u2014 working on: {emp.current_task.description[:40]}"
+        tasks = len(emp.task_history)
+        tasks_tag = f", {tasks} tasks done" if tasks else ""
+        return f"Switched to **{resolved}** ({emp.display_role}{tasks_tag}){status}.\nType `back` to return to CTO."
 
     def _back(self) -> str:
         """Return conversation to the CTO."""
+        prev = self.company.active_employee
         cto = self.company.get_cto()
-        if cto:
-            self.company.set_active(cto.name)
-            return "Back to **CTO**."
-        # No CTO yet — create one
-        cto = self.company.ensure_cto()
+        if not cto:
+            cto = self.company.ensure_cto()
         self.company.set_active(cto.name)
+        if prev and prev.role != "cto":
+            return f"Back to **CTO**. (Was talking to {prev.name})"
         return "Back to **CTO**."
 
     def _status(self) -> str:
-        return self._team_overview()
+        """Show concise company status."""
+        n = len(self.company.employees)
+        if n == 0:
+            return (
+                "No employees yet.\n"
+                "Tell the CTO what to build, or type `hire <role>` directly."
+            )
+
+        working = [e for e in self.company.employees.values()
+                   if e.status == EmployeeStatus.WORKING and e.role != "cto"]
+        idle = [e for e in self.company.employees.values()
+                if e.status == EmployeeStatus.IDLE and e.role != "cto"]
+        n_teams = len(self.company.teams)
+
+        parts = [f"**Status** \u2014 {n} employee{'s' if n != 1 else ''}"]
+        if n_teams:
+            parts[0] += f", {n_teams} team{'s' if n_teams != 1 else ''}"
+
+        if working:
+            parts.append("")
+            for e in working:
+                task = e.current_task.description[:45] if e.current_task else "..."
+                parts.append(f"  {e.name} \u2014 working: {task}")
+        if idle:
+            parts.append(f"  {len(idle)} idle: {', '.join(e.name for e in idle[:5])}")
+
+        # Roadmap
+        rm = self.company.active_roadmap
+        if rm:
+            state = rm.state.value if rm.state else "pending"
+            parts.append(f"\n  Roadmap: {rm.done_count}/{rm.total_count} done ({state})")
+
+        # Cost
+        if self.company.total_cost > 0:
+            parts.append(f"  Cost: ${self.company.total_cost:.4f}")
+
+        return "\n".join(parts)
 
     def _costs(self) -> str:
         return self.company.cost_report
@@ -651,38 +834,35 @@ class Router:
 
     def _help(self) -> str:
         return (
-            "**Shipwright Commands**\n\n"
-            "  Just type naturally — the CTO handles your requests.\n"
-            "  The CTO hires engineers, delegates work, reviews quality,\n"
-            "  and presents results. You only get asked when a decision is needed.\n\n"
-            "  `@<name> <message>` — Talk directly to an employee\n"
-            "  `back` — Return to CTO conversation\n"
-            "  `talk <name>` — Switch active employee\n"
-            "  `status` — Company overview\n"
-            "  `roadmap` — Show current roadmap status\n"
-            "  `go` / `approve` — Approve and start roadmap execution\n"
-            "  `continue` / `resume` — Resume a paused roadmap\n"
-            "  `costs` — Budget/token usage per employee\n"
-            "  `history <name>` — Task history for an employee\n\n"
-            "  **Power user commands (bypass CTO):**\n"
-            "  `roles` — List available roles to hire\n"
-            "  `hire <role>` — Hire an employee directly\n"
-            '  `hire <role> as "Name"` — Hire with a custom name\n'
-            "  `fire <name>` — Fire an employee\n"
-            "  `fire <team>` — Fire an entire team\n"
-            "  `team create <name>` — Create a team\n"
-            "  `promote <name> to lead of <team>` — Make someone team lead\n"
-            "  `assign <name> to <team>` — Add employee to a team\n"
-            '  `assign <name> "<task>"` — Give work directly to an employee\n'
-            "  `ship` — Open PR for all work\n"
-            "  `save` — Save current state\n"
-            "  `sessions` — List saved sessions\n"
-            "  `session save <name>` / `session load <name>` — Manage sessions\n"
-            "  `session clear` — Reset everything\n"
-            "  `shop` — Browse all available roles & specialists\n"
-            "  `installed` — List custom/installed plugins\n"
-            "  `inspect <name>` — Show role/specialist details\n"
-            "  `help` — Show this help\n"
+            "**Shipwright** \u2014 AI engineering company\n\n"
+            "  Just talk naturally. The CTO handles hiring, delegation,\n"
+            "  review, and revision. You get asked when a decision is needed.\n\n"
+            "  **Conversation**\n"
+            "  `@<name> <msg>` \u2014 Direct message to employee\n"
+            "  `talk <name>` \u2014 Switch to an employee\n"
+            "  `back` \u2014 Return to CTO\n\n"
+            "  **Visibility**\n"
+            "  `status` \u2014 Quick company overview\n"
+            "  `org` \u2014 Org chart with teams\n"
+            "  `who` \u2014 Who is doing what right now\n"
+            "  `roadmap` \u2014 Current roadmap progress\n"
+            "  `costs` \u2014 Spending per employee\n"
+            "  `history <name>` \u2014 Task history\n\n"
+            "  **Execution**\n"
+            "  `go` / `approve` \u2014 Start roadmap execution\n"
+            "  `continue` \u2014 Resume paused work\n"
+            "  `pause` / `pause now` \u2014 Pause roadmap\n"
+            "  `stop` \u2014 Cancel roadmap\n\n"
+            "  **Management**\n"
+            "  `hire <role>` \u2014 Hire directly (bypass CTO)\n"
+            "  `fire <name>` \u2014 Dismiss employee or team\n"
+            "  `team create <name>` \u2014 Create a team\n"
+            "  `promote <name> to lead of <team>`\n"
+            '  `assign <name> "<task>"` \u2014 Assign work directly\n'
+            "  `ship` \u2014 Open PR\n\n"
+            "  **Session**\n"
+            "  `save` / `sessions` / `session load <name>`\n"
+            "  `roles` / `shop` / `installed` / `inspect <name>`\n"
         )
 
     def _shop(self) -> str:
@@ -723,15 +903,194 @@ class Router:
         return inspect_role(name, self.config)
 
     # ------------------------------------------------------------------
+    # Intent handlers — greeting, pause, stop, resume
+    # ------------------------------------------------------------------
+
+    def _handle_greeting(self, text: str) -> str:
+        """Handle casual greetings without triggering any work.
+
+        Context-aware: reflects actual company state naturally.
+        Never resumes paused work — just acknowledges it.
+        """
+        import random
+
+        has_employees = any(
+            e.role != "cto" for e in self.company.employees.values()
+        )
+        has_cto = self.company.get_cto() is not None
+
+        # Check for paused/interrupted roadmap
+        roadmap = self.company.active_roadmap
+        paused_desc = None
+        if roadmap and roadmap.state in (
+            RoadmapState.PAUSED, RoadmapState.INTERRUPTED,
+        ):
+            paused_desc = roadmap.paused_task_description
+
+        if paused_desc:
+            short = paused_desc[:50]
+            return (
+                f"We have a paused roadmap on **{short}** "
+                f"({roadmap.done_count}/{roadmap.total_count} done). "
+                f"Type `continue` to pick up, or tell me what's next."
+            )
+
+        if not has_cto and not has_employees:
+            openers = [
+                "Tell me what we're building.",
+                "What's the project?",
+                "Ready when you are. What do we need?",
+            ]
+            return random.choice(openers)
+
+        if has_employees:
+            working = [
+                e for e in self.company.employees.values()
+                if e.status == EmployeeStatus.WORKING
+            ]
+            idle = [
+                e for e in self.company.employees.values()
+                if e.status == EmployeeStatus.IDLE and e.role != "cto"
+            ]
+            if working:
+                names = ", ".join(e.name for e in working[:3])
+                return f"{names} {'is' if len(working) == 1 else 'are'} on it. What do you need?"
+            if idle:
+                count = len(idle)
+                return f"Team's here — {count} engineer{'s' if count != 1 else ''} idle. What's next?"
+            return "What do you need?"
+
+        return "What are we working on?"
+
+    def _handle_pause(self) -> str:
+        """Gracefully pause the active roadmap at a safe point."""
+        roadmap = self.company.active_roadmap
+        if not roadmap:
+            return "Nothing to pause — no active roadmap."
+        if roadmap.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
+            return "Already paused."
+        if roadmap.state == RoadmapState.STOPPED:
+            return "Roadmap was already stopped."
+
+        roadmap.paused = True
+        roadmap.state = RoadmapState.PAUSED
+        # Mark any running task back to pending
+        for t in roadmap.tasks:
+            if t.status.value == "running":
+                from shipwright.company.employee import RoadmapTaskStatus
+                t.status = RoadmapTaskStatus.PENDING
+        desc = roadmap.paused_task_description or "current work"
+        return (
+            f"**Paused.** Roadmap stopped at a safe point.\n"
+            f"Next up: {desc}\n"
+            f"Type `continue` or `resume` to pick up where you left off."
+        )
+
+    def _handle_pause_now(self) -> str:
+        """Immediately interrupt the active roadmap."""
+        roadmap = self.company.active_roadmap
+        if not roadmap:
+            return "Nothing to pause — no active roadmap."
+        if roadmap.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
+            return "Already paused."
+        if roadmap.state == RoadmapState.STOPPED:
+            return "Roadmap was already stopped."
+
+        roadmap.paused = True
+        roadmap.state = RoadmapState.INTERRUPTED
+        # Mark any running task back to pending
+        for t in roadmap.tasks:
+            if t.status.value == "running":
+                from shipwright.company.employee import RoadmapTaskStatus
+                t.status = RoadmapTaskStatus.PENDING
+        desc = roadmap.paused_task_description or "current work"
+        return (
+            f"**Interrupted.** Roadmap halted immediately.\n"
+            f"Was working on: {desc}\n"
+            f"Type `continue` to retry, or `stop` to cancel."
+        )
+
+    def _handle_stop(self) -> str:
+        """Cancel the active roadmap, keeping history."""
+        roadmap = self.company.active_roadmap
+        if not roadmap:
+            return "Nothing to stop — no active roadmap."
+        if roadmap.state == RoadmapState.STOPPED:
+            return "Already stopped."
+
+        roadmap.paused = True
+        roadmap.state = RoadmapState.STOPPED
+        # Mark any running task back to pending (won't be resumed)
+        for t in roadmap.tasks:
+            if t.status.value == "running":
+                from shipwright.company.employee import RoadmapTaskStatus
+                t.status = RoadmapTaskStatus.FAILED
+                t.output_summary = "Cancelled by user"
+        done = roadmap.done_count
+        total = roadmap.total_count
+        return (
+            f"**Stopped.** Roadmap cancelled ({done}/{total} tasks were done).\n"
+            f"History preserved. Start a new task whenever you're ready."
+        )
+
+    async def _handle_resume(
+        self,
+        on_text: Callable[[str], None] | None = None,
+        on_delegation_start: Callable[[str, str, int, int], None] | None = None,
+        on_delegation_end: Callable[[str, float, bool], None] | None = None,
+        on_progress: Callable[[str], None] | None = None,
+    ) -> str:
+        """Resume a paused/interrupted roadmap. Only called for explicit resume intent."""
+        roadmap = self.company.active_roadmap
+        if not roadmap:
+            return "Nothing to resume — no active roadmap."
+        if roadmap.state == RoadmapState.STOPPED:
+            return "Roadmap was stopped. Start a new task instead."
+        if roadmap.state not in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
+            # Check if it's an unapproved roadmap — treat continue as approval
+            if not roadmap.approved:
+                return await self._roadmap_approve(
+                    on_text=on_text,
+                    on_delegation_start=on_delegation_start,
+                    on_delegation_end=on_delegation_end,
+                    on_progress=on_progress,
+                ) or "No roadmap to resume."
+            return "Roadmap is already running."
+
+        # Reset any failed tasks to pending for retry
+        for t in roadmap.tasks:
+            if t.status.value == "failed":
+                from shipwright.company.employee import RoadmapTaskStatus
+                t.status = RoadmapTaskStatus.PENDING
+                break
+        roadmap.paused = False
+        roadmap.state = RoadmapState.RUNNING
+        result = await self.company.execute_roadmap(
+            on_text=on_text,
+            on_delegation_start=on_delegation_start,
+            on_delegation_end=on_delegation_end,
+            on_progress=on_progress,
+        )
+        return result
+
+    # ------------------------------------------------------------------
     # Roadmap commands
     # ------------------------------------------------------------------
 
     def _roadmap_status(self) -> str:
-        """Show the current roadmap status."""
+        """Show the current roadmap status with context."""
         roadmap = self.company.active_roadmap
         if not roadmap:
-            return "No active roadmap."
-        return roadmap.status_display()
+            return "No active roadmap. Ask the CTO to build something."
+        lines = []
+        if roadmap.original_request:
+            lines.append(f"**Roadmap** \u2014 {roadmap.original_request[:60]}\n")
+        lines.append(roadmap.status_display())
+        if roadmap.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
+            lines.append(f"\nType `continue` to resume, `stop` to cancel.")
+        elif not roadmap.approved:
+            lines.append(f"\nType `go` to start execution.")
+        return "\n".join(lines)
 
     async def _roadmap_approve(
         self,
@@ -744,38 +1103,13 @@ class Router:
         roadmap = self.company.active_roadmap
         if not roadmap:
             return None
+        if roadmap.state == RoadmapState.STOPPED:
+            return "Roadmap was stopped. Start a new task instead."
         if roadmap.approved and not roadmap.paused:
             return "Roadmap is already running."
         roadmap.approved = True
         roadmap.paused = False
-        result = await self.company.execute_roadmap(
-            on_text=on_text,
-            on_delegation_start=on_delegation_start,
-            on_delegation_end=on_delegation_end,
-            on_progress=on_progress,
-        )
-        return result
-
-    async def _roadmap_resume(
-        self,
-        on_text: Callable[[str], None] | None = None,
-        on_delegation_start: Callable[[str, str, int, int], None] | None = None,
-        on_delegation_end: Callable[[str, float, bool], None] | None = None,
-        on_progress: Callable[[str], None] | None = None,
-    ) -> str | None:
-        """Resume a paused roadmap. Returns None if no roadmap to resume."""
-        roadmap = self.company.active_roadmap
-        if not roadmap:
-            return None
-        if not roadmap.paused:
-            return None  # Not paused, fall through
-        # Reset any failed task to pending so it can be retried
-        for t in roadmap.tasks:
-            if t.status.value == "failed":
-                from shipwright.company.employee import RoadmapTaskStatus
-                t.status = RoadmapTaskStatus.PENDING
-                break
-        roadmap.paused = False
+        roadmap.state = RoadmapState.RUNNING
         result = await self.company.execute_roadmap(
             on_text=on_text,
             on_delegation_start=on_delegation_start,
@@ -785,15 +1119,10 @@ class Router:
         return result
 
     def _suggest_hire(self, text: str) -> str:
-        roles = list_roles(self.config)
         return (
-            "No employees yet. Hire some!\n\n"
-            f"Available roles: {', '.join(roles[:8])}\n\n"
-            "Examples:\n"
-            "  `hire architect`\n"
-            "  `hire backend-dev`\n"
-            '  `hire frontend-dev as "Kai"`\n\n'
-            "Type `roles` for the full list or `help` for all commands."
+            "No team yet. Just describe what you need \u2014 the CTO will "
+            "hire the right people and get it done.\n\n"
+            "Or hire directly: `hire backend-dev`, `hire architect`"
         )
 
     # ---- Session management ----

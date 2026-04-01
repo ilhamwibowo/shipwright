@@ -163,6 +163,73 @@ class TestCLIOutput:
         assert DIM in captured.out
 
 
+class TestCLIOutputEventFeed:
+    """Test event feed separation in CLIOutput."""
+
+    def test_event_count_starts_at_zero(self):
+        ui = CLIOutput()
+        assert ui._event_count == 0
+
+    def test_delegation_start_increments_events(self, capsys):
+        ui = CLIOutput()
+        ui.on_delegation_start("architect", "Explore codebase", 1, 5)
+        assert ui._event_count == 1
+        captured = capsys.readouterr()
+        # Should have the event feed pipe separator
+        assert "\u2502" in captured.out
+
+    def test_delegation_end_increments_events(self, capsys):
+        ui = CLIOutput()
+        ui.on_delegation_end("architect", 12.3, False)
+        assert ui._event_count == 1
+
+    def test_progress_increments_events(self, capsys):
+        ui = CLIOutput()
+        ui.on_progress("Reviewing results...")
+        assert ui._event_count == 1
+
+    def test_start_thinking_resets_event_count(self):
+        ui = CLIOutput()
+        ui._event_count = 5
+        ui.start_thinking()
+        assert ui._event_count == 0
+
+
+class TestStatusStrip:
+    """Test the status strip rendering."""
+
+    def test_status_strip_empty_company(self):
+        from shipwright.interfaces.cli import _render_status_strip
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            session = Session(id="test")
+            router = Router(config=config, session=session)
+            strip = _render_status_strip(router)
+            assert "CTO offline" in strip
+
+    def test_status_strip_with_cto(self):
+        from shipwright.interfaces.cli import _render_status_strip
+        from shipwright.conversation.router import Router
+        from shipwright.conversation.session import Session
+        from shipwright.config import Config
+        from pathlib import Path
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(repo_root=Path(tmp), sessions_dir=Path(tmp) / "sessions")
+            session = Session(id="test")
+            router = Router(config=config, session=session)
+            router.company.ensure_cto()
+            strip = _render_status_strip(router)
+            assert "CTO" in strip
+
+
 class TestSpinner:
     def test_initial_state(self):
         s = Spinner()

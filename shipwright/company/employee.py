@@ -75,13 +75,24 @@ class RoadmapTask:
         )
 
 
+class RoadmapState(str, Enum):
+    """Execution state of a roadmap."""
+    PENDING = "pending"        # Created but not yet approved
+    RUNNING = "running"        # Actively executing
+    PAUSED = "paused"          # Gracefully paused by user (safe point)
+    INTERRUPTED = "interrupted" # Force-stopped mid-task (pause now / Ctrl+C)
+    STOPPED = "stopped"        # Cancelled by user, keep history
+    COMPLETE = "complete"      # All tasks done
+
+
 @dataclass
 class Roadmap:
     """A multi-task execution plan created by the CTO for large projects."""
     tasks: list[RoadmapTask] = field(default_factory=list)
     original_request: str = ""
     approved: bool = False
-    paused: bool = False  # True when interrupted (Ctrl+C, failure)
+    paused: bool = False  # backward compat — True when paused/interrupted
+    state: RoadmapState = RoadmapState.PENDING
 
     @property
     def current_task_index(self) -> int | None:
@@ -114,9 +125,28 @@ class Roadmap:
                 )
         return "\n\n".join(parts)
 
+    @property
+    def paused_task_description(self) -> str | None:
+        """Return the description of the task that was paused/interrupted, if any."""
+        for t in self.tasks:
+            if t.status in (RoadmapTaskStatus.PENDING, RoadmapTaskStatus.RUNNING):
+                return t.description
+        return self.original_request or None
+
     def status_display(self) -> str:
         """Human-readable roadmap status."""
-        lines = [f"**Roadmap** ({self.done_count}/{self.total_count} tasks done)\n"]
+        state_label = ""
+        if self.state == RoadmapState.PAUSED:
+            state_label = " — PAUSED"
+        elif self.state == RoadmapState.INTERRUPTED:
+            state_label = " — INTERRUPTED"
+        elif self.state == RoadmapState.STOPPED:
+            state_label = " — STOPPED"
+
+        lines = [
+            f"**Roadmap** ({self.done_count}/{self.total_count} tasks done{state_label})\n",
+            f"  {'─' * 48}",
+        ]
         for t in self.tasks:
             icon = {
                 "pending": "[ ]",
@@ -124,11 +154,25 @@ class Roadmap:
                 "done": "[x]",
                 "failed": "[!]",
             }[t.status.value]
-            lines.append(f"  {icon} {t.index}. {t.description}")
+            # Mark which task was paused/interrupted
+            suffix = ""
+            if t.status == RoadmapTaskStatus.PENDING and self.state == RoadmapState.PAUSED:
+                # First pending task after pause
+                if t.index == (self.current_task_index or 0):
+                    suffix = "  ← paused here"
+            elif t.status == RoadmapTaskStatus.PENDING and self.state == RoadmapState.INTERRUPTED:
+                if t.index == (self.current_task_index or 0):
+                    suffix = "  ← interrupted here"
+            lines.append(f"  {icon} {t.index}. {t.description}{suffix}")
             if t.output_summary:
                 lines.append(f"       {t.output_summary[:80]}")
-        if self.paused:
-            lines.append("\n  *Paused* — type `go` or `continue` to resume.")
+        lines.append(f"  {'─' * 48}")
+        if self.state == RoadmapState.PAUSED:
+            lines.append("\n  *Paused* — type `continue` or `resume` to pick up where you left off.")
+        elif self.state == RoadmapState.INTERRUPTED:
+            lines.append("\n  *Interrupted* — type `continue` or `resume` to retry.")
+        elif self.state == RoadmapState.STOPPED:
+            lines.append("\n  *Stopped* — roadmap cancelled. Start a new task or create a new roadmap.")
         return "\n".join(lines)
 
     def to_dict(self) -> dict:
@@ -137,15 +181,30 @@ class Roadmap:
             "original_request": self.original_request,
             "approved": self.approved,
             "paused": self.paused,
+            "state": self.state.value,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "Roadmap":
+        state_str = data.get("state")
+        if state_str:
+            state = RoadmapState(state_str)
+        else:
+            # Backward compat: derive state from old paused bool
+            paused = data.get("paused", False)
+            approved = data.get("approved", False)
+            if paused:
+                state = RoadmapState.PAUSED
+            elif approved:
+                state = RoadmapState.RUNNING
+            else:
+                state = RoadmapState.PENDING
         return cls(
             tasks=[RoadmapTask.from_dict(t) for t in data.get("tasks", [])],
             original_request=data.get("original_request", ""),
             approved=data.get("approved", False),
             paused=data.get("paused", False),
+            state=state,
         )
 
 

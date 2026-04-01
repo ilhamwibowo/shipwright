@@ -392,8 +392,8 @@ class TestStatusSummary:
         company.promote_to_lead("Alex", "core")
 
         summary = company.status_summary
-        assert "Team: core" in summary
-        assert "Team Lead" in summary
+        assert "core" in summary
+        assert "Lead" in summary
 
     def test_empty_company(self, config: Config):
         company = Company(config=config)

@@ -29,6 +29,7 @@ from shipwright.company.employee import (
     LeadResponse,
     ReviseRequest,
     Roadmap,
+    RoadmapState,
     RoadmapTask,
     RoadmapTaskStatus,
     parse_delegations,
@@ -436,6 +437,27 @@ class Company:
             else "No tasks completed yet."
         )
 
+        # Roadmap context
+        roadmap_section = ""
+        if self.active_roadmap:
+            rm = self.active_roadmap
+            if rm.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
+                desc = rm.paused_task_description or "unknown"
+                roadmap_section = (
+                    f"\n### Paused Work\n"
+                    f"There is a {rm.state.value} roadmap: \"{rm.original_request}\"\n"
+                    f"Progress: {rm.done_count}/{rm.total_count} tasks done. "
+                    f"Next task: {desc}\n"
+                    f"**Do NOT resume this work unless the CEO explicitly says "
+                    f"continue/resume/go. Mentioning it briefly is fine.**"
+                )
+            elif rm.state == RoadmapState.STOPPED:
+                roadmap_section = (
+                    f"\n### Stopped Roadmap\n"
+                    f"A previous roadmap was cancelled: \"{rm.original_request}\" "
+                    f"({rm.done_count}/{rm.total_count} done). This is just context."
+                )
+
         return f"""{base_prompt}
 
 ## Current Company State
@@ -445,6 +467,7 @@ class Company:
 
 ### Recent Work
 {tasks_section}
+{roadmap_section}
 
 ### Project
 {self.project_context or "No project context loaded yet."}
@@ -590,6 +613,7 @@ class Company:
             return "No CTO available."
 
         roadmap.paused = False
+        roadmap.state = RoadmapState.RUNNING
         collected_reports: list[str] = []
 
         while True:
@@ -629,6 +653,7 @@ class Company:
                 task.status = RoadmapTaskStatus.FAILED
                 task.output_summary = "Budget exceeded"
                 roadmap.paused = True
+                roadmap.state = RoadmapState.PAUSED
                 collected_reports.append(
                     f"Task {idx}/{roadmap.total_count} **paused**: Budget exceeded."
                 )
@@ -702,11 +727,12 @@ class Company:
                         )
 
             except asyncio.CancelledError:
-                # Ctrl+C / cancellation — pause gracefully
+                # Ctrl+C / cancellation — interrupted
                 task.status = RoadmapTaskStatus.PENDING
                 roadmap.paused = True
+                roadmap.state = RoadmapState.INTERRUPTED
                 collected_reports.append(
-                    f"Task {idx}/{roadmap.total_count} **paused**: Interrupted. "
+                    f"Task {idx}/{roadmap.total_count} **interrupted**. "
                     "Type `continue` to resume."
                 )
                 break
@@ -716,6 +742,7 @@ class Company:
                 task.status = RoadmapTaskStatus.FAILED
                 task.output_summary = f"Error: {exc}"
                 roadmap.paused = True
+                roadmap.state = RoadmapState.PAUSED
                 collected_reports.append(
                     f"Task {idx}/{roadmap.total_count} **failed**: {exc}\n"
                     "Roadmap paused. Fix the issue and type `continue` to retry, "
@@ -725,6 +752,7 @@ class Company:
 
         # Final summary
         if roadmap.is_complete:
+            roadmap.state = RoadmapState.COMPLETE
             collected_reports.append(
                 f"\n**Roadmap complete!** All {roadmap.total_count} tasks done."
             )
@@ -1211,43 +1239,82 @@ class Company:
 
     @property
     def status_summary(self) -> str:
-        """Human-readable company status."""
+        """Human-readable company status with tree hierarchy."""
         lines = []
+
+        # CTO line
+        cto = self.get_cto()
+        if cto:
+            lines.append(f"  CTO \u2014 online")
 
         # Teams
         for team in self.teams.values():
-            lines.append(f"\n  Team: {team.name} ({len(team.members)} members)")
-            for member_name in team.members:
-                emp = self.employees.get(member_name)
-                if emp:
-                    lead_tag = " (Team Lead)" if emp.is_lead else ""
-                    status = emp.status.value
-                    if emp.current_task:
-                        status = f"working: {emp.current_task.description[:40]}"
-                    lines.append(f"    {emp.name} ({emp.display_role}){lead_tag} — {status}")
+            members = [self.employees.get(n) for n in team.members]
+            members = [e for e in members if e is not None]
+            lines.append(f"\n  **{team.name}** ({len(members)} members)")
+            for i, emp in enumerate(members):
+                is_last = i == len(members) - 1
+                connector = "\u2514\u2500\u2500" if is_last else "\u251c\u2500\u2500"
+                lead_tag = " (Lead)" if emp.is_lead else ""
+                status = self._emp_status_line(emp)
+                lines.append(
+                    f"  {connector} {emp.name} ({emp.display_role}){lead_tag}"
+                    f" \u2014 {status}"
+                )
 
-        # Independent employees
+        # Independent employees (excluding CTO)
         independent = [
             emp for emp in self.employees.values()
-            if not emp.team
+            if not emp.team and emp.role != "cto"
         ]
         if independent:
             if self.teams:
-                lines.append("\n  Independent:")
-            for emp in independent:
-                status = emp.status.value
-                if emp.current_task:
-                    status = f"working: {emp.current_task.description[:40]}"
-                lines.append(f"    {emp.name} ({emp.display_role}) — {status}")
+                lines.append("")
+            for i, emp in enumerate(independent):
+                is_last = i == len(independent) - 1
+                connector = "\u2514\u2500\u2500" if is_last else "\u251c\u2500\u2500"
+                status = self._emp_status_line(emp)
+                lines.append(
+                    f"  {connector} {emp.name} ({emp.display_role})"
+                    f" \u2014 {status}"
+                )
+
+        # Roadmap status
+        if self.active_roadmap:
+            rm = self.active_roadmap
+            state_tag = ""
+            if rm.state == RoadmapState.PAUSED:
+                state_tag = " *Paused*"
+            elif rm.state == RoadmapState.INTERRUPTED:
+                state_tag = " *Interrupted*"
+            elif rm.state == RoadmapState.STOPPED:
+                state_tag = " *Stopped*"
+            elif rm.state == RoadmapState.RUNNING:
+                state_tag = " (running)"
+            lines.append(
+                f"\n  Roadmap: {rm.done_count}/{rm.total_count} done{state_tag}"
+            )
+            desc = rm.paused_task_description
+            if desc and rm.state in (RoadmapState.PAUSED, RoadmapState.INTERRUPTED):
+                lines.append(f"  Next: {desc[:60]}")
 
         # Cost summary
         if self.total_cost > 0:
-            lines.append(f"\n  Spent: ${self.total_cost:.4f}")
+            lines.append(f"\n  Cost: ${self.total_cost:.4f}")
             if self.config.budget_limit_usd > 0:
                 remaining = self.config.budget_limit_usd - self.total_cost
                 lines.append(f"  Budget remaining: ${remaining:.4f}")
 
         return "\n".join(lines)
+
+    def _emp_status_line(self, emp: Employee) -> str:
+        """Build a compact status string for an employee."""
+        if emp.status == EmployeeStatus.WORKING and emp.current_task:
+            return f"working: {emp.current_task.description[:40]}"
+        task_count = len(emp.task_history)
+        if task_count:
+            return f"idle  [{task_count} tasks]"
+        return "idle"
 
     @property
     def cost_report(self) -> str:

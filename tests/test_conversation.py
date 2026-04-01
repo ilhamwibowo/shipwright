@@ -100,7 +100,8 @@ class TestRouter:
         router = self._make_router(config)
         is_cmd, response = router._try_sync_command("help", "help")
         assert is_cmd
-        assert "Commands" in response
+        assert "Shipwright" in response
+        assert "hire" in response
 
     def test_roles_command(self, config: Config):
         router = self._make_router(config)
@@ -193,7 +194,7 @@ class TestRouter:
             f"talk {emp_names[1]}", f"talk {emp_names[1].lower()}",
         )
         assert is_cmd
-        assert "Now talking" in response
+        assert "Switched to" in response
 
     def test_status_command(self, config: Config):
         router = self._make_router(config)
@@ -207,7 +208,8 @@ class TestRouter:
 
         is_cmd, response = router._try_sync_command("status", "status")
         assert is_cmd
-        assert "Your Company" in response
+        assert "Status" in response
+        assert "idle" in response
 
     def test_costs_command(self, config: Config):
         router = self._make_router(config)
@@ -284,7 +286,7 @@ class TestRouter:
 
     def test_team_overview_command(self, config: Config):
         router = self._make_router(config)
-        is_cmd, response = router._try_sync_command("team", "team")
+        is_cmd, response = router._try_sync_command("org", "org")
         assert is_cmd
         assert "No employees" in response
 
@@ -292,7 +294,6 @@ class TestRouter:
         router = self._make_router(config)
         response = router._suggest_hire("do something")
         assert "hire" in response.lower()
-        assert "roles" in response.lower()
 
 
 # ---------------------------------------------------------------------------
